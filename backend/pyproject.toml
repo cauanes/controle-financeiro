@@ -1,0 +1,22 @@
+[project]
+name = "family-finance-hub"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "asyncpg>=0.30,<1",
+  "pydantic-settings>=2.7,<3", "httpx>=0.28,<1", "redis>=6,<7",
+  "python-multipart>=0.0.20,<1", "openpyxl>=3.1.5,<4", "defusedxml>=0.7.1,<1",
+  "argon2-cffi>=23.1,<26"
+]
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1", "pgserver==0.1.4"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+pythonpath = ["."]
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 110
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
