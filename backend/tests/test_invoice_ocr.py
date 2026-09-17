@@ -143,3 +143,48 @@ def test_ocr_on_real_invoices():
         assert len(text) > 0
         parsed = parse_invoice(text)
         assert isinstance(parsed, InvoiceResult)
+
+
+def test_merge_classified_transactions():
+    from app.workers.runner import (
+        build_invoice_header_text,
+        build_invoice_question_text,
+        merge_classified_transactions,
+    )
+
+    t1 = [
+        {"description": "SAMS CLUB", "amount": 128.50, "date": "2026-09-15", "installment_current": 1, "installment_total": 3, "category_name": "Supermercado"},
+        {"description": "POSTO IPIRANGA", "amount": 50.00, "date": "2026-09-14", "installment_current": None, "installment_total": None, "category_name": "Combustível"},
+    ]
+    t2 = [
+        {"description": "SAMS CLUB", "amount": 128.50, "date": "2026-09-15", "installment_current": 1, "installment_total": 3, "category_name": "Supermercado"}, # duplicate
+        {"description": "UBER *TRIP", "amount": 25.40, "date": "2026-09-13", "installment_current": None, "installment_total": None, "category_name": "Transporte"},
+    ]
+
+    merged = merge_classified_transactions(t1, t2)
+    assert len(merged) == 3
+    assert merged[0]["description"] == "SAMS CLUB"
+    assert merged[1]["description"] == "POSTO IPIRANGA"
+    assert merged[2]["description"] == "UBER *TRIP"
+
+    summary = {
+        "issuer": "Sam's Club",
+        "total_amount": 203.90,
+        "due_date": "2026-10-10",
+        "closing_date": "2026-10-01",
+        "available_limit": 5000.0,
+        "total_limit": 10000.0,
+    }
+    q_text = build_invoice_question_text(summary, merged, "Sam's Club")
+    assert "Sam's Club" in q_text
+    assert "203.90" in q_text
+    assert "SAMS CLUB" in q_text
+    assert "POSTO IPIRANGA" in q_text
+    assert "UBER *TRIP" in q_text
+    assert "Deseja importar estes lançamentos" in q_text
+
+    h_text = build_invoice_header_text(summary, "Sam's Club")
+    assert "Sam's Club" in h_text
+    assert "203.90" in h_text
+    assert "Envie os prints com a lista de compras" in h_text
+
