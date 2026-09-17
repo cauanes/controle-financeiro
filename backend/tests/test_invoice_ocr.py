@@ -1,11 +1,11 @@
 import glob
 from pathlib import Path
+
 import pytest
 
 from app.modules.categorization.merchant_classifier import classify_merchant
-from app.modules.ingestion.invoice_parser import parse_invoice, InvoiceResult
-from app.modules.ingestion.ocr import extract_text_from_image, get_tessdata_dir
-
+from app.modules.ingestion.invoice_parser import InvoiceResult, parse_invoice
+from app.modules.ingestion.ocr import extract_text_from_image
 
 SAMPLE_INVOICE_TEXT = """
 Sam's Club

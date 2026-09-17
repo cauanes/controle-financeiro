@@ -1,6 +1,8 @@
 import re
-import httpx
 from typing import Any
+
+import httpx
+
 from app.core.db import rows
 from app.modules.resources import normalize
 
