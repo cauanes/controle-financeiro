@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.core.db import Context, audit, digest, emit, get, insert, rows, set_scope, update, wire
 from app.core.errors import require
 from app.core.schemas import Strict, Version
+from app.modules.conversations.parser import intent
 from app.modules.conversations.service import ensure_session, receive
 from app.modules.integrations.evolution import EvolutionAdapter
 
@@ -304,6 +305,18 @@ async def webhook(request: Request):
                 chat_jid,
             )
             if not group:
+                return Response(status_code=204)
+        else:
+            has_pending = await conn.fetchval(
+                """
+                SELECT 1 FROM pending_financial_actions p
+                JOIN conversation_sessions s ON s.id=p.session_id
+                WHERE s.channel_identity_id=$1 AND s.whatsapp_group_id IS NULL
+                AND p.status IN ('WAITING_INFORMATION','WAITING_CONFIRMATION')
+                """,
+                identity["id"],
+            )
+            if not has_pending and (not text or intent(text) == "UNKNOWN"):
                 return Response(status_code=204)
         session = await ensure_session(ctx, dict(identity), dict(group) if group else None)
         media = (

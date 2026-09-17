@@ -31,6 +31,7 @@ O áudio requer um serviço de transcrição configurado em `TRANSCRIPTION_URL`.
 ## Documentação
 
 - [PRD](docs/PRD.md) e [plano de implementação](docs/CODEX_IMPLEMENTATION_PLAN.md)
+- [Estado de cada entrega](docs/IMPLEMENTATION_STATUS.md)
 - [Regras financeiras](docs/FINANCIAL_RULES.md), [segurança](docs/SECURITY.md), [esquema](docs/DATABASE_SCHEMA.md)
 - [Conversação](docs/CONVERSATION_ENGINE.md), [WhatsApp](docs/WHATSAPP_SPEC.md), [áudio](docs/AUDIO_INGESTION.md)
 - [Frontend](docs/FRONTEND_SPEC.md), [API](docs/API_SPEC.md), [testes](docs/TESTING_STRATEGY.md)

@@ -1,6 +1,6 @@
 # Plano de implementação para Codex
 
-Este plano implementa o PRD por entregas verificáveis. O repositório contém apenas especificações neste momento. As pastas e migrations abaixo são propostas; criar código somente na execução das etapas. Não tentar implementar todas as áreas em uma única mudança.
+Este plano define as entregas verificáveis do PRD. A implementação atual e os limites comprovados estão em [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md). As migrations foram agrupadas de modo diferente dos números inicialmente propostos; os arquivos SQL aplicados são a referência do esquema em execução.
 
 ## Regras de execução
 

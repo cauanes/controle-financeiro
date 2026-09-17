@@ -350,7 +350,7 @@ async def process(ctx, session, message):
             f"Ouvi: “{text}”. Está correto? Responda sim ou envie a frase correta.",
         )
     detected = intent(text)
-    if session.get("whatsapp_group_id") and not action and detected == "UNKNOWN":
+    if not action and detected == "UNKNOWN":
         await update(
             ctx,
             "conversation_messages",
