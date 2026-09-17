@@ -1,6 +1,6 @@
 import re
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from app.core.db import audit, emit, get, insert, rows, update, wire
@@ -172,8 +172,20 @@ async def complete(ctx, action):
     return action, result
 
 
-async def ask(ctx, action, candidate, field, text, now):
+def numbered_choices(action, text, choices):
+    options = [
+        {"id": f"choice:{action['id']}:{index}", "label": label, "reply": reply}
+        for index, (label, reply) in enumerate(choices, 1)
+    ]
+    if options:
+        text += "\n" + "\n".join(f"{index}. {option['label']}" for index, option in enumerate(options, 1))
+        text += "\nResponda com o número ou escreva a opção."
+    return text, options
+
+
+async def ask(ctx, action, candidate, field, text, now, choices=None):
     candidate["answer_field"] = field
+    text, candidate["choice_options"] = numbered_choices(action, text, choices or [])
     action = await update(
         ctx,
         "pending_financial_actions",
@@ -190,8 +202,9 @@ async def ask(ctx, action, candidate, field, text, now):
     return action, text
 
 
-async def propose(ctx, action, candidate, text, message, now):
+async def propose(ctx, action, candidate, text, message, now, choices=None):
     candidate["answer_field"] = None
+    text, candidate["choice_options"] = numbered_choices(action, text, choices or [])
     return await update(
         ctx,
         "pending_financial_actions",
@@ -349,6 +362,19 @@ async def process(ctx, session, message):
             ctx, session, message, action,
             f"Ouvi: “{text}”. Está correto? Responda sim ou envie a frase correta.",
         )
+    options = action["extracted_data"].get("choice_options", []) if action else []
+    selected = next(
+        (
+            option
+            for index, option in enumerate(options, 1)
+            if text.strip() in (str(index), option["id"])
+        ),
+        None,
+    )
+    if selected:
+        text = selected["reply"]
+    elif options and (text.strip().isdigit() or text.strip().startswith("choice:")):
+        return await response(ctx, session, message, action, "Essa opção não está disponível. " + action["question"])
     detected = intent(text)
     is_whatsapp = session.get("channel") == "WHATSAPP"
     if is_whatsapp and not action and (
@@ -535,14 +561,16 @@ async def process(ctx, session, message):
 
         action, question = await handle_planning(ctx, action, text, message, now)
         return await response(ctx, session, message, action, question)
+    parse_today = action["created_at"].astimezone(ZoneInfo(ctx.timezone)).date() if action["intent"] == "CREATE_INCOME" else today
     candidate = await parser.parse(
-        ctx, text, today, action["extracted_data"], action["extracted_data"].get("answer_field")
+        ctx, text, parse_today, action["extracted_data"], action["extracted_data"].get("answer_field")
     )
     fields = candidate["fields"]
     if detected == "CONFIRM" and "transaction_date" in action["extracted_data"].get("fields", {}):
         fields["transaction_date"] = action["extracted_data"]["fields"]["transaction_date"]
-    required = ["amount", "financial_source", "transaction_date"]
-    if fields.get("type", {}).get("value") != "TRANSFER":
+    is_income = fields.get("type", {}).get("value") == "INCOME"
+    required = ["amount", "responsible_user_id", "category_id", "financial_source", "transaction_date"] if is_income else ["amount", "financial_source", "transaction_date"]
+    if fields.get("type", {}).get("value") == "EXPENSE":
         required.append("category_id")
     for field in required:
         item = fields.get(field)
@@ -551,19 +579,43 @@ async def process(ctx, session, message):
             or item.get("requires_confirmation")
             or field in candidate.get("ambiguous_fields", [])
         ):
+            choices = None
             questions = {
                 "amount": "Qual foi o valor exato?",
                 "financial_source": "Qual conta ou cartão foi utilizado? Se necessário, informe crédito ou débito.",
                 "transaction_date": f"Foi hoje, {today.strftime('%d/%m/%Y')}? Responda sim ou informe a data completa.",
                 "category_id": "O que você comprou? Informe a categoria ou responda “Sem categoria”.",
             }
+            if is_income:
+                if field == "responsible_user_id":
+                    people = await ctx.conn.fetch(
+                        "SELECT u.display_name FROM household_members m JOIN users u ON u.id=m.user_id WHERE m.status='ACTIVE' ORDER BY u.display_name"
+                    )
+                    questions[field] = "De quem é esta receita?"
+                    choices = [(p["display_name"], p["display_name"]) for p in people]
+                elif field == "category_id":
+                    person = fields.get("responsible_user_id", {}).get("value")
+                    profiles = await ctx.conn.fetch(
+                        "SELECT DISTINCT c.name FROM income_activity_profiles p JOIN categories c ON c.id=p.category_id WHERE ($1::uuid IS NULL OR p.user_id=$1::uuid) ORDER BY c.name",
+                        person,
+                    )
+                    questions[field] = "De qual trabalho veio a receita?"
+                    choices = [(p["name"], p["name"]) for p in profiles] or None
+                elif field == "financial_source":
+                    accounts = [account for account in await rows(ctx, "accounts") if not account["archived_at"]]
+                    questions[field] = (
+                        "Em qual conta o valor entrou?"
+                        if accounts
+                        else "Ainda não há conta cadastrada. Cadastre uma no aplicativo e depois informe aqui o nome dela."
+                    )
+                    choices = [(account["name"], account["name"]) for account in accounts[:10]] if len(accounts) <= 10 else None
             if field == "transaction_date":
                 candidate["proposed_date"] = item["value"] if item and item["value"] else today.isoformat()
                 if item:
                     questions[field] = (
                         f"Confirma a data {candidate['proposed_date']}? Responda sim ou informe outra data completa."
                     )
-            action, question = await ask(ctx, action, candidate, field, questions[field], now)
+            action, question = await ask(ctx, action, candidate, field, questions[field], now, choices)
             return await response(ctx, session, message, action, question)
     # Fully explicit fields may execute; inferred/historical material always asks first.
     material_suggested = any(fields[k].get("source") == "historical_pattern" for k in required)
@@ -573,6 +625,24 @@ async def process(ctx, session, message):
         action["id"],
         {"extracted_data": candidate, "missing_fields": [], "ambiguous_fields": []},
     )
+    if is_income:
+        person = await ctx.conn.fetchval(
+            "SELECT display_name FROM users WHERE id=$1", UUID(fields["responsible_user_id"]["value"])
+        )
+        category = await get(ctx, "categories", fields["category_id"]["value"])
+        source = fields["financial_source"]["value"]
+        account = await get(ctx, "accounts", source.get("id") or source.get("source_id"))
+        value = fields["amount"]["value"]
+        question = (
+            f"Confirma esta receita? R$ {value} · {person} · {category['name']} · "
+            f"conta {account['name']} · {fields['transaction_date']['value']} · "
+            f"{fields['description']['value']}."
+        )
+        action = await propose(
+            ctx, action, candidate, question, message, now,
+            [("Confirmar e registrar", "sim"), ("Cancelar", "cancelar")],
+        )
+        return await response(ctx, session, message, action, action["question"])
     if material_suggested:
         question = "Confirma o lançamento sugerido? " + str({k: v["value"] for k, v in fields.items()})
         action = await propose(ctx, action, candidate, question, message, now)

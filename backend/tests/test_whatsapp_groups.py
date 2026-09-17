@@ -70,17 +70,57 @@ async def test_group_creation_routes_participant_and_ignores_chatter(client, fam
 
     class Channel:
         async def send(self, instance, recipient, text):
-            destinations.append(recipient)
+            destinations.append((recipient, text))
             return "outbound-id"
 
     for _ in range(16):
         await tick(family["pool"], channel=Channel())
     transactions = (await client.get("/api/v1/transactions")).json()["data"]
     assert len(transactions) == 1
-    assert destinations == [group_jid]
+    assert [destination for destination, _ in destinations] == [group_jid]
     assert (await client.get("/api/v1/conversations")).json()["data"][0]["whatsapp_group_id"] == group.json()[
         "id"
     ]
+
+    async def owner_jid(self, instance):
+        return jid
+
+    monkeypatch.setattr(EvolutionAdapter, "owner_jid", owner_jid)
+    own_message = event("quanto gastei este mês?", "own-query", group=True)
+    own_message["data"]["key"].update({"fromMe": True, "participant": "12345@lid"})
+    assert (await client.post("/webhooks/evolution", json=own_message, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert [destination for destination, _ in destinations] == [group_jid, group_jid]
+
+    bot_echo = event(destinations[-1][1], "outbound-id", group=True)
+    bot_echo["data"]["key"].update({"fromMe": True, "participant": "12345@lid"})
+    assert (await client.post("/webhooks/evolution", json=bot_echo, headers=headers)).status_code == 204
+
+    async def participant_jid(self, instance, group_jid, lid):
+        assert group_jid == group.json()["group_jid"] and lid == "12345@lid"
+        return jid
+
+    monkeypatch.setattr(EvolutionAdapter, "participant_jid", participant_jid)
+    linked_lid = event("quanto gastei este mês?", "lid-query", group=True)
+    linked_lid["data"]["key"]["participant"] = "12345@lid"
+    assert (await client.post("/webhooks/evolution", json=linked_lid, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert [destination for destination, _ in destinations] == [group_jid, group_jid, group_jid]
+
+    income = event("Recebi 100 de salário no Itaú", "income-choice", group=True)
+    assert (await client.post("/webhooks/evolution", json=income, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "1. Minha família" in destinations[-1][1]
+
+    button = event("", "button-choice", group=True)
+    button["data"]["message"] = {"buttonsResponseMessage": {"selectedButtonId": "1"}}
+    assert (await client.post("/webhooks/evolution", json=button, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Confirma esta receita?" in destinations[-1][1]
 
 
 @pytest.mark.asyncio

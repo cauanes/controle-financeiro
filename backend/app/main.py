@@ -15,6 +15,7 @@ from app.core.errors import DomainError
 from app.modules.analytics.api import router as analytics_router
 from app.modules.conversations.api import router as conversations_router
 from app.modules.identity.api import router as identity_router
+from app.modules.income_profiles import router as income_profiles_router
 from app.modules.ingestion.api import router as imports_router
 from app.modules.integrations.api import router as integrations_router
 from app.modules.ledger.api import router as ledger_router
@@ -124,6 +125,7 @@ for router in (
     analytics_router,
     conversations_router,
     imports_router,
+    income_profiles_router,
     integrations_router,
     alerts_router,
     planning_router,

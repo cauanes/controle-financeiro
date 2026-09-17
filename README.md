@@ -26,6 +26,8 @@ O Compose inicia banco, Redis, migrações, API, worker e frontend. A API usa o 
 
 A integração precisa de uma instância Evolution conectada e de webhook autenticado. Cada pessoa entra por convite, vincula seu próprio número enviando `vincular <código>` em conversa privada e, depois, um administrador cria o grupo em **Configurações → WhatsApp e integrações**. O bot responde no grupo apenas a participantes vinculados; mensagens de conversa comum não acionam lançamentos. Veja o [guia do grupo](docs/runbooks/WHATSAPP_GROUP.md) para configuração, reconexão e limites.
 
+Para receitas, o bot usa os vínculos entre membro e atividade em `GET/POST /api/v1/income-activities`. Uma frase como `Recebi 770 Paciente Alice` pode sugerir Psicologia, mas o bot pergunta se a receita pertence à Carla ou ao Cauan quando ambos exercem essa atividade. Ele pede conta ou outra informação ausente e sempre mostra pessoa, atividade, valor, conta, data e descrição para confirmação antes de criar a transação.
+
 O áudio requer um serviço de transcrição configurado em `TRANSCRIPTION_URL`. Sem ele, o usuário pode continuar por texto. Conectores Open Finance não estão ativos nesta versão.
 
 ## Documentação

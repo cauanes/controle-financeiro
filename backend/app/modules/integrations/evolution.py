@@ -59,6 +59,8 @@ class EvolutionAdapter:
                 },
             )
         require(res.is_success, "Falha no envio ao WhatsApp.", "DELIVERY_FAILED", 503)
+        body = res.json()
+        return body.get("key", {}).get("id") if isinstance(body, dict) else None
     async def send_reaction(self, instance, key_id, remote_jid, emoji):
         if not (self.base and settings.evolution_api_key):
             return
@@ -105,6 +107,33 @@ class EvolutionAdapter:
             )
         require(res.is_success, "Grupo não encontrado na instância Evolution.", "GROUP_NOT_FOUND", 404)
         return res.json()
+
+    async def participant_jid(self, instance, group_jid, participant_lid):
+        group = await self.group_info(instance, group_jid)
+        matches = {
+            item.get("phoneNumber")
+            for item in group.get("participants", [])
+            if item.get("id") == participant_lid
+            and isinstance(item.get("phoneNumber"), str)
+            and item["phoneNumber"].endswith("@s.whatsapp.net")
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    async def owner_jid(self, instance):
+        """Resolve the phone JID for messages sent by the connected account itself."""
+        self.configured()
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            res = await client.get(
+                self.base + "/instance/fetchInstances",
+                headers=self.headers,
+                params={"instanceName": instance},
+            )
+        require(res.is_success, "Não foi possível identificar o número conectado.", "PROVIDER_UNAVAILABLE", 503)
+        instances = res.json()
+        require(isinstance(instances, list) and len(instances) == 1, "Instância Evolution não encontrada.", "PROVIDER_UNAVAILABLE", 503)
+        owner = instances[0].get("ownerJid")
+        require(isinstance(owner, str) and owner.endswith("@s.whatsapp.net"), "Número conectado inválido.", "PROVIDER_UNAVAILABLE", 503)
+        return owner
 
     async def test(self, instance):
         self.configured()

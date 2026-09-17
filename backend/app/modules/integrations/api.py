@@ -210,17 +210,22 @@ async def webhook(request: Request):
     require(isinstance(key, dict) and isinstance(key.get("id"), str), "Identificador de mensagem ausente.")
     chat_jid = key.get("remoteJid", "")
     is_group = chat_jid.endswith("@g.us")
-    if key.get("fromMe") or not (is_group or chat_jid.endswith("@s.whatsapp.net")):
+    from_me = key.get("fromMe") is True
+    if (from_me and not is_group) or not (is_group or chat_jid.endswith("@s.whatsapp.net")):
         return Response(status_code=204)
-    sender = (
-        (key.get("participantAlt") or key.get("participant") or data.get("participant"))
-        if is_group
-        else chat_jid
-    )
-    if not isinstance(sender, str) or not sender.endswith("@s.whatsapp.net"):
+    sender = (key.get("participantAlt") or key.get("participant") or data.get("participant")) if is_group else chat_jid
+    if not from_me and not isinstance(sender, str):
         return Response(status_code=204)
     message = data.get("message", {})
-    text = message.get("conversation") or message.get("extendedTextMessage", {}).get("text")
+    if not isinstance(message, dict):
+        return Response(status_code=204)
+    text = (
+        message.get("conversation")
+        or message.get("extendedTextMessage", {}).get("text")
+        or message.get("buttonsResponseMessage", {}).get("selectedButtonId")
+        or message.get("listResponseMessage", {}).get("singleSelectReply", {}).get("selectedRowId")
+        or message.get("templateButtonReplyMessage", {}).get("selectedId")
+    )
     audio = message.get("audioMessage")
     if not text and not audio:
         return Response(status_code=204)
@@ -241,6 +246,21 @@ async def webhook(request: Request):
         )
         await ctx.lock()
         iid = UUID(integration["id"])
+        group = None
+        if is_group:
+            group = await conn.fetchrow(
+                "SELECT * FROM whatsapp_groups WHERE integration_id=$1 AND group_jid=$2 AND status='ACTIVE'",
+                iid,
+                chat_jid,
+            )
+            if not group:
+                return Response(status_code=204)
+        if from_me:
+            sender = await EvolutionAdapter().owner_jid(event["instance"])
+        elif is_group and sender.endswith("@lid"):
+            sender = await EvolutionAdapter().participant_jid(event["instance"], chat_jid, sender)
+        if not sender or not sender.endswith("@s.whatsapp.net"):
+            return Response(status_code=204)
         event_key = chat_jid + ":" + sender + ":" + key["id"]
         if await conn.fetchval(
             "SELECT id FROM webhook_receipts WHERE integration_id=$1 AND provider_event_key=$2",
@@ -248,6 +268,23 @@ async def webhook(request: Request):
             event_key,
         ):
             return Response(status_code=200)
+        if from_me and await conn.fetchval(
+            """
+            SELECT 1 FROM outgoing_messages o
+            JOIN conversation_sessions s ON s.id=o.session_id
+            JOIN whatsapp_groups g ON g.id=s.whatsapp_group_id
+            WHERE o.integration_id=$1 AND g.group_jid=$2
+              AND (o.provider_message_id=$3 OR
+                   (o.text=$4 AND o.status IN ('SENDING','SENT','UNKNOWN')
+                    AND o.updated_at>now()-interval '2 minutes'))
+            LIMIT 1
+            """,
+            iid,
+            chat_jid,
+            key["id"],
+            text,
+        ):
+            return Response(status_code=204)
         identity = await conn.fetchrow(
             "SELECT * FROM channel_identities WHERE integration_id=$1 AND sender_key=$2 AND revoked_at IS NULL",
             iid,
@@ -297,16 +334,7 @@ async def webhook(request: Request):
         require(member and member["role"] != "VIEWER", "Associação revogada.", "FORBIDDEN", 403)
         ctx.user_id = identity["user_id"]
         ctx.role = member["role"]
-        group = None
-        if is_group:
-            group = await conn.fetchrow(
-                "SELECT * FROM whatsapp_groups WHERE integration_id=$1 AND group_jid=$2 AND status='ACTIVE'",
-                iid,
-                chat_jid,
-            )
-            if not group:
-                return Response(status_code=204)
-        else:
+        if not is_group:
             has_pending = await conn.fetchval(
                 """
                 SELECT 1 FROM pending_financial_actions p

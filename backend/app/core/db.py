@@ -97,7 +97,7 @@ async def system_context(pool, tenant_id, household_id, user_id=None):
 
 # Only static, server-owned table/column names may enter SQL identifiers.
 TABLES = set(
-    "household_members member_invites whatsapp_groups accounts categories merchants credit_cards credit_card_invoices transactions transaction_sources invoice_payments category_rules merchant_rules user_financial_preferences integrations channel_identities conversation_sessions conversation_messages pending_financial_actions outgoing_messages webhook_receipts channel_link_tokens import_templates import_jobs import_rows transaction_matches budgets budget_categories recurring_transactions goals goal_contributions assets liabilities financial_snapshots alert_rules alerts audit_logs outbox_events processed_events idempotency_keys".split()
+    "household_members member_invites whatsapp_groups accounts categories income_activity_profiles merchants credit_cards credit_card_invoices transactions transaction_sources invoice_payments category_rules merchant_rules user_financial_preferences integrations channel_identities conversation_sessions conversation_messages pending_financial_actions outgoing_messages webhook_receipts channel_link_tokens import_templates import_jobs import_rows transaction_matches budgets budget_categories recurring_transactions goals goal_contributions assets liabilities financial_snapshots alert_rules alerts audit_logs outbox_events processed_events idempotency_keys".split()
 )
 
 

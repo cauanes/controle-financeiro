@@ -91,11 +91,15 @@ def intent(text):
         return "CREATE_GOAL"
     if re.search(r"\b(transferi|transferencia|transferir)\b", value):
         return "CREATE_TRANSFER"
-    if re.search(r"\b(recebi|recebimento|receita|salario)\b", value):
+    if re.search(r"\b(recebi|recebeu|recebemos|recebimento|receita|salario|honorarios|ganhei|ganhou|entrou)\b", value):
         return "CREATE_INCOME"
-    if re.search(r"\b(gastei|gasto|paguei|comprei|coloca|registra|anota)\b", value) or re.search(
-        r"\d.*\b(mercado|gasolina|amazon|reais|credito|debito|pix)\b", value
-    ) or re.search(r"\bcompra\s+de\b", value):
+    if re.search(r"\b(gastei|gasto|paguei|comprei|coloca|registra|anota)\b", value):
+        return "CREATE_EXPENSE"
+    if contains(value, "paciente") and amounts(text):
+        return "CREATE_INCOME"
+    if re.search(r"\d.*\b(mercado|gasolina|amazon|reais|credito|debito|pix)\b", value) or re.search(
+        r"\bcompra\s+de\b", value
+    ):
         return "CREATE_EXPENSE"
     return "UNKNOWN"
 
@@ -170,6 +174,7 @@ class RuleParser:
         kind = {"CREATE_EXPENSE": "EXPENSE", "CREATE_INCOME": "INCOME", "CREATE_TRANSFER": "TRANSFER"}.get(
             candidate["intent"]
         )
+        income_profiles = await rows(ctx, "income_activity_profiles") if kind == "INCOME" else []
         if kind:
             fields["type"] = evidence(kind)
         if "amount" not in fields or answer_field == "amount":
@@ -185,6 +190,8 @@ class RuleParser:
             fields["transaction_date"]["requires_confirmation"] = uncertain
         elif uncertain:
             candidate["ambiguous_fields"].append("transaction_date")
+        elif kind == "INCOME" and "transaction_date" not in fields:
+            fields["transaction_date"] = evidence(today.isoformat(), "assumed_today")
         if not fields.get("description"):
             fields["description"] = evidence(text[:500])
         # Never choose a source just because there is one available.
@@ -242,7 +249,7 @@ class RuleParser:
             candidate["ambiguous_fields"].append("financial_source")
         if contains(norm, "sem categoria"):
             fields["category_id"] = evidence(None)
-        elif kind in ("EXPENSE", "INCOME"):
+        elif kind in ("EXPENSE", "INCOME") and not income_profiles:
             category = await categorize(ctx, text, kind)
             if category:
                 fields["category_id"] = category
@@ -259,4 +266,57 @@ class RuleParser:
                 fields["merchant_id"] = evidence(str(merchant["id"]))
         if contains(norm, "amazon") and "category_id" not in fields:
             candidate["merchant_hint"] = "Amazon"
+        if kind == "INCOME" and income_profiles:
+            members = await ctx.conn.fetch(
+                "SELECT m.user_id,u.display_name FROM household_members m JOIN users u ON u.id=m.user_id WHERE m.status='ACTIVE'"
+            )
+            person_matches = [m for m in members if contains(norm, m["display_name"])]
+            if answer_field == "responsible_user_id" and norm in ("eu", "sou eu", "minha", "meu"):
+                person_matches = [m for m in members if m["user_id"] == ctx.user_id]
+            if len(person_matches) == 1:
+                fields["responsible_user_id"] = evidence(str(person_matches[0]["user_id"]))
+            elif len(person_matches) > 1:
+                fields.pop("responsible_user_id", None)
+                candidate["ambiguous_fields"].append("responsible_user_id")
+
+            categories = {
+                c["id"]: c for c in await rows(ctx, "categories")
+                if c["kind"] == "INCOME" and not c["archived_at"]
+            }
+
+            def matching_activities(phrase):
+                return {
+                    str(profile["category_id"])
+                    for profile in income_profiles
+                    if profile["category_id"] in categories
+                    and any(
+                        contains(phrase, word)
+                        for word in (categories[profile["category_id"]]["name"], *profile["keywords"])
+                    )
+                }
+
+            activities = matching_activities(text)
+            if not activities and answer_field != "category_id":
+                activities = matching_activities(candidate.get("original_text", ""))
+            if len(activities) == 1:
+                fields["category_id"] = evidence(next(iter(activities)), "income_activity_hint")
+            elif len(activities) > 1:
+                fields.pop("category_id", None)
+                candidate["ambiguous_fields"].append("category_id")
+
+            person = fields.get("responsible_user_id", {}).get("value")
+            category = fields.get("category_id", {}).get("value")
+            if category and person and not any(
+                str(profile["user_id"]) == person and str(profile["category_id"]) == category
+                for profile in income_profiles
+            ):
+                fields.pop("category_id", None)
+                candidate["ambiguous_fields"].append("category_id")
+            if category and not person:
+                owners = {
+                    str(profile["user_id"])
+                    for profile in income_profiles if str(profile["category_id"]) == category
+                }
+                if len(owners) == 1:
+                    fields["responsible_user_id"] = evidence(next(iter(owners)), "income_activity_hint")
         return candidate

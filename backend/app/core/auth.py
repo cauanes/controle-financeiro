@@ -17,8 +17,8 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
 class Login(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    tenant: str = Field(min_length=1, max_length=80)
+    model_config = ConfigDict(extra="ignore")
+    tenant: str | None = None
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=1, max_length=512)
 
@@ -48,13 +48,15 @@ def cookies(response, access, refresh, csrf):
 @router.post("/login")
 async def login(body: Login, request: Request, response: Response):
     check_origin(request)
+    tenant_slug = body.tenant.lower() if body.tenant else None
+    throttle_key = digest((tenant_slug + ":" if tenant_slug else "") + body.email.lower())
     async with request.app.state.pool.acquire() as conn:
         allowed = await conn.fetchval(
-            "SELECT throttle_login($1)", digest(body.tenant.lower() + ":" + body.email.lower())
+            "SELECT throttle_login($1)", throttle_key
         )
         require(allowed, "Muitas tentativas. Aguarde 15 minutos.", "RATE_LIMITED", 429)
         user = await conn.fetchrow(
-            "SELECT * FROM login_lookup($1,$2)", body.tenant.lower(), body.email.lower()
+            "SELECT * FROM login_lookup($1,$2)", tenant_slug, body.email.lower()
         )
         import asyncio
 
