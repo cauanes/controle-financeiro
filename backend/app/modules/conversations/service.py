@@ -84,7 +84,7 @@ async def receive(
             "normalized_text": text,
             "transcription_metadata": metadata,
             "media": media,
-            "processing_status": "RECEIVED" if kind == "AUDIO" and text is None else "READY",
+            "processing_status": "RECEIVED" if kind in ("AUDIO", "IMAGE") else "READY",
             "received_at": received_at or datetime.now(timezone.utc),
         },
     )

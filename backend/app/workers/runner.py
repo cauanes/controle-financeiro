@@ -11,13 +11,97 @@ from app.core.config import settings
 from app.core.db import emit, get, insert, make_pool, system_context, update
 from app.core.errors import DomainError
 from app.modules.categorization.merchant_classifier import classify_merchant
-from app.modules.conversations.service import process, response
+from app.modules.conversations.service import intent, process, response
 from app.modules.ingestion.audio import HttpTranscriptionProvider
 from app.modules.ingestion.invoice_parser import parse_invoice
 from app.modules.ingestion.ocr import extract_text_from_image
 from app.modules.integrations.evolution import EvolutionAdapter
 
 logger = logging.getLogger("finance.worker")
+
+
+def merge_classified_transactions(existing_txs: list[dict], new_txs: list[dict]) -> list[dict]:
+    merged = list(existing_txs)
+    for new_t in new_txs:
+        is_dup = False
+        for ex_t in merged:
+            same_amt = abs(float(ex_t.get("amount", 0)) - float(new_t.get("amount", 0))) < 0.001
+            same_desc = ex_t.get("description", "").strip().lower() == new_t.get("description", "").strip().lower()
+            same_date = ex_t.get("date") == new_t.get("date")
+            same_inst = ex_t.get("installment_current") == new_t.get("installment_current")
+            if same_amt and same_desc and same_date and same_inst:
+                is_dup = True
+                break
+        if not is_dup:
+            merged.append(new_t)
+    return merged
+
+
+def build_invoice_question_text(summary: dict, transactions: list[dict], card_name: str) -> str:
+    issuer_title = summary.get("issuer") or card_name or "Fatura de Cartão"
+    lines = [f"📄 *Fatura identificada: {issuer_title}*"]
+    if summary.get("total_amount"):
+        lines.append(f"💰 *Total da fatura:* R$ {float(summary['total_amount']):.2f}")
+    if summary.get("due_date"):
+        try:
+            due_fmt = datetime.strptime(summary["due_date"], "%Y-%m-%d").strftime("%d/%m/%Y")
+            clos_fmt = (
+                datetime.strptime(summary["closing_date"], "%Y-%m-%d").strftime("%d/%m/%Y")
+                if summary.get("closing_date")
+                else "-"
+            )
+            lines.append(f"🗓️ *Vencimento:* {due_fmt} | *Fechamento:* {clos_fmt}")
+        except Exception:
+            pass
+    if summary.get("available_limit") and summary.get("total_limit"):
+        lines.append(
+            f"💳 *Limite:* R$ {float(summary['available_limit']):.2f} disp. de R$ {float(summary['total_limit']):.2f}"
+        )
+
+    lines.append(f"\n📊 *Lançamentos identificados ({len(transactions)} itens):*")
+    for i, t in enumerate(transactions[:10], 1):
+        dt_str = "Sem data"
+        if t.get("date"):
+            try:
+                dt_str = datetime.strptime(t["date"], "%Y-%m-%d").strftime("%d/%m")
+            except Exception:
+                dt_str = str(t["date"])
+        inst_str = (
+            f" ({t['installment_current']}/{t['installment_total']})"
+            if t.get("installment_total")
+            else ""
+        )
+        lines.append(f"{i}. {dt_str} · {t['description']} · R$ {float(t['amount']):.2f}{inst_str} ➔ {t.get('category_name', 'Outros')}")
+    if len(transactions) > 10:
+        lines.append(f"... e mais {len(transactions) - 10} lançamentos.")
+
+    lines.append(f"\n_Deseja importar estes lançamentos no cartão *{card_name}*?_")
+    lines.append("Responda *sim* para confirmar ou *cancelar*.")
+    return "\n".join(lines)
+
+
+def build_invoice_header_text(summary: dict, card_name: str) -> str:
+    issuer_title = summary.get("issuer") or card_name or "Fatura de Cartão"
+    lines = [f"📄 *Fatura identificada: {issuer_title}*"]
+    if summary.get("total_amount"):
+        lines.append(f"💰 *Total da fatura:* R$ {float(summary['total_amount']):.2f}")
+    if summary.get("due_date"):
+        try:
+            due_fmt = datetime.strptime(summary["due_date"], "%Y-%m-%d").strftime("%d/%m/%Y")
+            clos_fmt = (
+                datetime.strptime(summary["closing_date"], "%Y-%m-%d").strftime("%d/%m/%Y")
+                if summary.get("closing_date")
+                else "-"
+            )
+            lines.append(f"🗓️ *Vencimento:* {due_fmt} | *Fechamento:* {clos_fmt}")
+        except Exception:
+            pass
+    if summary.get("available_limit") and summary.get("total_limit"):
+        lines.append(
+            f"💳 *Limite:* R$ {float(summary['available_limit']):.2f} disp. de R$ {float(summary['total_limit']):.2f}"
+        )
+    lines.append("\nEnvie os prints com a lista de compras/lançamentos para importar.")
+    return "\n".join(lines)
 
 
 async def scopes(pool):
@@ -87,6 +171,18 @@ async def handle(pool, scope, event, transcriber=None, channel=None):
                     await event_done(ctx, event)
                     return
 
+                session = await get(ctx, "conversation_sessions", message["session_id"])
+                if not ocr_text.strip():
+                    await response(
+                        ctx,
+                        session,
+                        message,
+                        None,
+                        "Não consegui identificar texto legível nesta imagem. Envie uma foto mais nítida da fatura ou comprovante.",
+                    )
+                    await event_done(ctx, event)
+                    return
+
                 invoice = parse_invoice(ocr_text)
 
                 # Classify transactions
@@ -103,96 +199,169 @@ async def handle(pool, scope, event, transcriber=None, channel=None):
                 # Look for matching card in DB
                 cards = await ctx.conn.fetch("SELECT * FROM credit_cards WHERE archived_at IS NULL")
                 matched_card = None
+                issuer_name = invoice.summary.issuer or ""
                 for c in cards:
                     c_name_l = c["name"].lower()
-                    if invoice.summary.issuer and (c_name_l in invoice.summary.issuer.lower() or invoice.summary.issuer.lower() in c_name_l):
+                    if issuer_name and (c_name_l in issuer_name.lower() or issuer_name.lower() in c_name_l):
                         matched_card = c
                         break
                     for tx in invoice.transactions:
                         if tx.card and tx.card.last4 and tx.card.last4 in c_name_l:
                             matched_card = c
                             break
-                if not matched_card and cards:
+                if not matched_card and len(cards) == 1:
                     matched_card = cards[0]
 
-                card_name = matched_card["name"] if matched_card else (invoice.summary.issuer or "Cartão de Crédito")
-                has_invoice_data = bool(invoice.summary.total_amount or len(classified_txs) > 0 or invoice.summary.issuer)
+                card_name = matched_card["name"] if matched_card else (issuer_name or "Cartão de Crédito")
+                has_summary_data = bool(
+                    invoice.summary.total_amount
+                    or invoice.summary.due_date
+                    or invoice.summary.closing_date
+                    or invoice.summary.issuer
+                    or invoice.summary.total_limit
+                )
+                has_invoice_data = has_summary_data or len(classified_txs) > 0
 
-                if has_invoice_data and len(classified_txs) > 0:
-                    session = await get(ctx, "conversation_sessions", message["session_id"])
-                    issuer_title = invoice.summary.issuer or "Fatura de Cartão"
-                    lines = [f"📄 *Fatura identificada: {issuer_title}*"]
-                    if invoice.summary.total_amount:
-                        lines.append(f"💰 *Total da fatura:* R$ {invoice.summary.total_amount:.2f}")
-                    if invoice.summary.due_date:
-                        due_fmt = datetime.strptime(invoice.summary.due_date, "%Y-%m-%d").strftime("%d/%m/%Y")
-                        clos_fmt = (
-                            datetime.strptime(invoice.summary.closing_date, "%Y-%m-%d").strftime("%d/%m/%Y")
-                            if invoice.summary.closing_date
-                            else "-"
-                        )
-                        lines.append(f"🗓️ *Vencimento:* {due_fmt} | *Fechamento:* {clos_fmt}")
-                    if invoice.summary.available_limit and invoice.summary.total_limit:
-                        lines.append(
-                            f"💳 *Limite:* R$ {invoice.summary.available_limit:.2f} disp. de R$ {invoice.summary.total_limit:.2f}"
-                        )
-
-                    lines.append(f"\n📊 *Lançamentos identificados ({len(classified_txs)} itens):*")
-                    for i, t in enumerate(classified_txs[:10], 1):
-                        dt_str = (
-                            datetime.strptime(t["date"], "%Y-%m-%d").strftime("%d/%m")
-                            if t.get("date")
-                            else "Sem data"
-                        )
-                        inst_str = (
-                            f" ({t['installment_current']}/{t['installment_total']})"
-                            if t.get("installment_total")
-                            else ""
-                        )
-                        lines.append(f"{i}. {dt_str} · {t['description']} · R$ {t['amount']:.2f}{inst_str} ➔ {t['category_name']}")
-                    if len(classified_txs) > 10:
-                        lines.append(f"... e mais {len(classified_txs) - 10} lançamentos.")
-
-                    lines.append(f"\n_Deseja importar estes lançamentos no cartão *{card_name}*?_")
-                    lines.append("Responda *sim* para confirmar ou *cancelar*.")
-                    question_text = "\n".join(lines)
-
+                if has_invoice_data:
+                    existing_action_row = await ctx.conn.fetchrow(
+                        "SELECT * FROM pending_financial_actions WHERE session_id=$1 AND status IN ('WAITING_INFORMATION','WAITING_CONFIRMATION') FOR UPDATE",
+                        session["id"],
+                    )
+                    existing_action = dict(existing_action_row) if existing_action_row else None
                     now = datetime.now(timezone.utc)
-                    action = await insert(
-                        ctx,
-                        "pending_financial_actions",
-                        {
-                            "session_id": session["id"],
-                            "user_id": session["user_id"],
-                            "intent": "IMPORT_INVOICE",
-                            "raw_message": ocr_text,
-                            "extracted_data": {
-                                "schema_version": 1,
-                                "summary": asdict(invoice.summary),
-                                "transactions": classified_txs,
-                                "matched_card_id": str(matched_card["id"]) if matched_card else None,
-                                "matched_card_name": card_name,
-                                "issuer": invoice.summary.issuer,
+
+                    if existing_action and existing_action["intent"] == "IMPORT_INVOICE":
+                        ex_data = existing_action.get("extracted_data") or {}
+                        ex_txs = ex_data.get("transactions") or []
+                        merged_txs = merge_classified_transactions(ex_txs, classified_txs)
+                        ex_sum = ex_data.get("summary") or {}
+                        new_sum = asdict(invoice.summary)
+                        merged_sum = {
+                            "total_amount": new_sum.get("total_amount") or ex_sum.get("total_amount"),
+                            "due_date": new_sum.get("due_date") or ex_sum.get("due_date"),
+                            "closing_date": new_sum.get("closing_date") or ex_sum.get("closing_date"),
+                            "minimum_payment": new_sum.get("minimum_payment") or ex_sum.get("minimum_payment"),
+                            "available_limit": new_sum.get("available_limit") or ex_sum.get("available_limit"),
+                            "total_limit": new_sum.get("total_limit") or ex_sum.get("total_limit"),
+                            "issuer": new_sum.get("issuer") or ex_sum.get("issuer"),
+                        }
+                        final_card_id = str(matched_card["id"]) if matched_card else ex_data.get("matched_card_id")
+                        final_card_name = (
+                            matched_card["name"]
+                            if matched_card
+                            else (ex_data.get("matched_card_name") or merged_sum.get("issuer") or "Cartão de Crédito")
+                        )
+                        final_issuer = merged_sum.get("issuer") or final_card_name
+
+                        if len(merged_txs) > 0:
+                            question_text = build_invoice_question_text(merged_sum, merged_txs, final_card_name)
+                            action_status = "WAITING_CONFIRMATION"
+                        else:
+                            question_text = build_invoice_header_text(merged_sum, final_card_name)
+                            action_status = "WAITING_INFORMATION"
+
+                        raw_combined = ((existing_action.get("raw_message") or "") + "\n---\n" + ocr_text).strip()
+                        action = await update(
+                            ctx,
+                            "pending_financial_actions",
+                            existing_action["id"],
+                            {
+                                "raw_message": raw_combined,
+                                "extracted_data": {
+                                    "schema_version": 1,
+                                    "summary": merged_sum,
+                                    "transactions": merged_txs,
+                                    "matched_card_id": final_card_id,
+                                    "matched_card_name": final_card_name,
+                                    "issuer": final_issuer,
+                                },
+                                "status": action_status,
+                                "question": question_text,
+                                "expires_at": now + timedelta(hours=24),
+                                "confirmation_prompt_message_id": message["id"],
                             },
-                            "status": "WAITING_CONFIRMATION",
-                            "question": question_text,
-                            "expires_at": now + timedelta(hours=24),
-                            "confirmation_prompt_message_id": message["id"],
-                        },
-                    )
-                    await response(ctx, session, message, action, question_text)
+                        )
+                        await response(ctx, session, message, action, question_text)
+                    else:
+                        if existing_action:
+                            await update(
+                                ctx, "pending_financial_actions", existing_action["id"], {"status": "CANCELLED"}
+                            )
+
+                        new_sum = asdict(invoice.summary)
+                        if len(classified_txs) > 0:
+                            question_text = build_invoice_question_text(new_sum, classified_txs, card_name)
+                            action_status = "WAITING_CONFIRMATION"
+                        else:
+                            question_text = build_invoice_header_text(new_sum, card_name)
+                            action_status = "WAITING_INFORMATION"
+
+                        action = await insert(
+                            ctx,
+                            "pending_financial_actions",
+                            {
+                                "session_id": session["id"],
+                                "user_id": session["user_id"],
+                                "intent": "IMPORT_INVOICE",
+                                "raw_message": ocr_text,
+                                "extracted_data": {
+                                    "schema_version": 1,
+                                    "summary": new_sum,
+                                    "transactions": classified_txs,
+                                    "matched_card_id": str(matched_card["id"]) if matched_card else None,
+                                    "matched_card_name": card_name,
+                                    "issuer": invoice.summary.issuer,
+                                },
+                                "status": action_status,
+                                "question": question_text,
+                                "expires_at": now + timedelta(hours=24),
+                                "confirmation_prompt_message_id": message["id"],
+                            },
+                        )
+                        await response(ctx, session, message, action, question_text)
                 else:
-                    await update(
-                        ctx,
-                        "conversation_messages",
-                        message["id"],
-                        {
-                            "normalized_text": ocr_text,
-                            "media": None,
-                            "processing_status": "READY",
-                        },
-                    )
-                    await emit(ctx, "ProcessMessage", message["id"])
+                    det = intent(ocr_text)
+                    if det in (
+                        "CREATE_EXPENSE",
+                        "CREATE_INCOME",
+                        "CREATE_TRANSFER",
+                        "CREATE_GOAL",
+                        "CREATE_BUDGET",
+                        "UPDATE_TRANSACTION",
+                        "DELETE_TRANSACTION",
+                    ) or det.startswith("QUERY_"):
+                        await update(
+                            ctx,
+                            "conversation_messages",
+                            message["id"],
+                            {
+                                "normalized_text": ocr_text,
+                                "media": None,
+                                "processing_status": "READY",
+                            },
+                        )
+                        await emit(ctx, "ProcessMessage", message["id"])
+                    else:
+                        if session.get("channel") == "WHATSAPP":
+                            await response(
+                                ctx,
+                                session,
+                                message,
+                                None,
+                                "Não consegui identificar lançamentos ou dados de fatura nesta imagem. Envie uma foto mais nítida.",
+                            )
+                        else:
+                            await update(
+                                ctx,
+                                "conversation_messages",
+                                message["id"],
+                                {
+                                    "normalized_text": ocr_text,
+                                    "media": None,
+                                    "processing_status": "READY",
+                                },
+                            )
+                            await emit(ctx, "ProcessMessage", message["id"])
                 await event_done(ctx, event)
         else:
             audio, mime = await channel.media(integration["instance_key"], message["media"])
