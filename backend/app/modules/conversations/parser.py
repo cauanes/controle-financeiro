@@ -93,9 +93,9 @@ def intent(text):
         return "CREATE_TRANSFER"
     if re.search(r"\b(recebi|recebimento|receita|salario)\b", value):
         return "CREATE_INCOME"
-    if re.search(r"\b(gastei|gasto|paguei|comprei|compra|coloca|registra|anota)\b", value) or re.search(
-        r"\d.*\b(mercado|gasolina|amazon|reais|credito|debito)\b", value
-    ):
+    if re.search(r"\b(gastei|gasto|paguei|comprei|coloca|registra|anota)\b", value) or re.search(
+        r"\d.*\b(mercado|gasolina|amazon|reais|credito|debito|pix)\b", value
+    ) or re.search(r"\bcompra\s+de\b", value):
         return "CREATE_EXPENSE"
     return "UNKNOWN"
 

@@ -350,7 +350,24 @@ async def process(ctx, session, message):
             f"Ouvi: “{text}”. Está correto? Responda sim ou envie a frase correta.",
         )
     detected = intent(text)
-    if not action and detected == "UNKNOWN":
+    is_whatsapp = session.get("channel") == "WHATSAPP"
+    if is_whatsapp and not action and (
+        detected == "UNKNOWN"
+        or (
+            is_whatsapp
+            and detected
+            not in (
+                "CREATE_EXPENSE",
+                "CREATE_INCOME",
+                "CREATE_TRANSFER",
+                "UPDATE_TRANSACTION",
+                "DELETE_TRANSACTION",
+                "CREATE_GOAL",
+                "CREATE_BUDGET",
+            )
+            and not detected.startswith("QUERY_")
+        )
+    ):
         await update(
             ctx,
             "conversation_messages",
@@ -364,12 +381,30 @@ async def process(ctx, session, message):
     if detected == "CANCEL":
         if action:
             action = await update(ctx, "pending_financial_actions", action["id"], {"status": "CANCELLED"})
+            return await response(
+                ctx,
+                session,
+                message,
+                action,
+                "Lançamento pendente cancelado.",
+            )
+        if is_whatsapp:
+            await update(
+                ctx,
+                "conversation_messages",
+                message["id"],
+                {
+                    "processing_status": "PROCESSED",
+                    "processed_at": now,
+                },
+            )
+            return None
         return await response(
             ctx,
             session,
             message,
             action,
-            "Lançamento pendente cancelado." if action else "Não há lançamento pendente.",
+            "Não há lançamento pendente.",
         )
     if detected == "CONFIRM":
         if (
@@ -401,6 +436,17 @@ async def process(ctx, session, message):
                 ctx, session, message, action, "✅ Operação confirmada e registrada.", result
             )
         else:
+            if is_whatsapp:
+                await update(
+                    ctx,
+                    "conversation_messages",
+                    message["id"],
+                    {
+                        "processing_status": "PROCESSED",
+                        "processed_at": now,
+                    },
+                )
+                return None
             return await response(
                 ctx,
                 session,
@@ -447,6 +493,17 @@ async def process(ctx, session, message):
             "CREATE_GOAL",
             "CREATE_BUDGET",
         ):
+            if is_whatsapp:
+                await update(
+                    ctx,
+                    "conversation_messages",
+                    message["id"],
+                    {
+                        "processing_status": "PROCESSED",
+                        "processed_at": now,
+                    },
+                )
+                return None
             return await response(
                 ctx,
                 session,
