@@ -129,7 +129,7 @@ async def test_group_creation_routes_participant_and_ignores_chatter(client, fam
 
     invoice_text = (
         "Fatura\nValor atual\nR$ 72,31\nVence em 12/10/2026\nFecha em 01/10/2026\n"
-        "Segunda-feira, 15 de junho\nPagamento recebido R$ 10,00\nCRF 4857 BGS SAMS CLUB BA R$ 72,31"
+        "Segunda-feira, 15 de junho\nPagamento recebido R$ 10,00\nCRF 4857 BGS LOJA BA R$ 72,31"
     )
     monkeypatch.setattr("app.workers.runner.extract_text_from_image", lambda image, mime: invoice_text)
     photo = event("", "image-with-pending-income", group=True)
