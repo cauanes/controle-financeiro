@@ -1,6 +1,6 @@
 # Cacau Finanças da Família
 
-Aplicação de finanças familiares com FastAPI, PostgreSQL, Redis, React e conversas por WhatsApp via Evolution API. Texto e áudio passam pelo mesmo motor; dados materiais incertos ficam pendentes até o usuário confirmar.
+Aplicação de finanças familiares com FastAPI, PostgreSQL, Redis, React e conversas por WhatsApp via Evolution API. Texto, áudio e imagens de fatura são recebidos pelo grupo; dados materiais incertos ficam pendentes até o usuário confirmar.
 
 ## Iniciar localmente
 
@@ -31,6 +31,8 @@ Para receitas, o bot usa os vínculos entre membro e atividade em `GET/POST /api
 Esses vínculos aparecem em **Configurações → Atividades de receita**. No WhatsApp, as perguntas oferecem opções numeradas (`1`, `2`...) e aceitam também o nome; na tela **Conversar**, as opções são botões clicáveis. A instância atual usa Evolution 2.3.7 com Baileys 7.0.0-rc.9, combinação com relatos de falha em botões nativos; veja o [guia do grupo](docs/runbooks/WHATSAPP_GROUP.md).
 
 O áudio requer um serviço de transcrição configurado em `TRANSCRIPTION_URL`. Sem ele, o usuário pode continuar por texto. Conectores Open Finance não estão ativos nesta versão.
+
+Fotos e prints JPG/PNG/WebP são lidos localmente com Tesseract OCR, sem serviço de IA. O bot propõe despesas com valor, data, comerciante e categoria sugerida; também avisa sobre valores ilegíveis, possíveis duplicatas e diferença entre a soma dos itens e o total da fatura. Nada é importado antes de uma confirmação explícita. Enquanto houver outro lançamento pendente na mesma conversa, o bot lê a imagem, informa o conflito e pede para concluir ou cancelar a pendência antes de reenviar a fatura. Veja os comandos de revisão no [guia do grupo](docs/runbooks/WHATSAPP_GROUP.md).
 
 ## Documentação
 

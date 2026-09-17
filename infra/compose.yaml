@@ -49,6 +49,7 @@ services:
       TRANSCRIPTION_URL: ${TRANSCRIPTION_URL:-}
       TRANSCRIPTION_API_KEY: ${TRANSCRIPTION_API_KEY:-}
       TRANSCRIPTION_MODEL: ${TRANSCRIPTION_MODEL:-}
+      SEARXNG_URL: ${SEARXNG_URL:-}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -67,6 +68,8 @@ services:
       dockerfile: backend/Dockerfile
     command: ["python", "-m", "app.workers.runner"]
     environment: *runtime_env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       migrate:
         condition: service_completed_successfully

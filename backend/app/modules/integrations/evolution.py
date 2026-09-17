@@ -36,7 +36,10 @@ class EvolutionAdapter:
                 "POST",
                 self.base + "/chat/getBase64FromMediaMessage/" + quote(instance, safe=""),
                 headers=self.headers,
-                json={"message": {"key": message["key"]}, "convertToMp4": False},
+                json={
+                    "message": {"key": message["key"], "message": message["message"]},
+                    "convertToMp4": False,
+                },
             ) as res:
                 require(res.is_success, "Falha ao baixar mídia.", "MEDIA_FAILED", 503)
                 chunks = bytearray()
@@ -48,7 +51,7 @@ class EvolutionAdapter:
                 body = json.loads(chunks)
         mime = body.get("mimetype") or message.get("mime_type", "")
         raw_b64 = body.get("base64", "")
-        if mime.startswith("image/"):
+        if message.get("mime_type", "").startswith("image/") or mime.startswith("image/"):
             try:
                 data = base64.b64decode(raw_b64)
             except Exception:

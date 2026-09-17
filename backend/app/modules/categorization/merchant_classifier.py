@@ -3,10 +3,9 @@ from typing import Any
 
 import httpx
 
+from app.core.config import settings
 from app.core.db import rows
 from app.modules.resources import normalize
-
-SEARXNG_URL = "http://127.0.0.1:8888"
 
 # 1. Deterministic Known Merchants / Brands Dictionary (100% offline & fast)
 KNOWN_MERCHANT_PATTERNS: dict[str, list[str]] = {
@@ -16,10 +15,10 @@ KNOWN_MERCHANT_PATTERNS: dict[str, list[str]] = {
         "mercado", "hortifruti", "sacolao", "sacolão", "mambo", "st marche", "natural da terra", "crf"
     ],
     "Alimentação": [
-        "happy salgados", "mcdonalds", "mc donald", "burger king", "bk", "ifood", "rappi", "subway",
-        "outback", "starbucks", "restaurante", "pizzaria", "padaria", "confeitaria", "lanchonete",
+        "happy salgados", "mcdonalds", "mc donald", "burger king", "bk", "ifood", "ifd", "rappi", "subway",
+        "outback", "starbucks", "restaurante", "pizzaria", "pizza", "padaria", "confeitaria", "lanchonete",
         "bar", "cafe", "café", "pastelaria", "salgados", "churrascaria", "hamburgueria", "sorveteria",
-        "bacio di latte", "carmelita", "bistrô", "bistro", "espetinho"
+        "bacio di latte", "carmelita", "bistrô", "bistro", "espetinho", "recanto"
     ],
     "Combustível": [
         "posto", "shell", "ipiranga", "petrobras", "br distribuidora", "ale", "auto posto",
@@ -64,6 +63,8 @@ SEARXNG_KEYWORD_MAP = {
 
 async def search_searxng(query: str) -> tuple[str | None, float]:
     """Fallback classifier querying local SearXNG instance."""
+    if not settings.searxng_url:
+        return None, 0.0
     clean_q = re.sub(r"[\*#\-_/]", " ", query)
     clean_q = re.sub(r"\s+", " ", clean_q).strip()
     clean_q = f'"{clean_q}" brasil'
@@ -71,7 +72,7 @@ async def search_searxng(query: str) -> tuple[str | None, float]:
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
             res = await client.get(
-                f"{SEARXNG_URL}/search",
+                f"{settings.searxng_url.rstrip('/')}/search",
                 params={"q": clean_q, "format": "json", "language": "pt-BR"}
             )
             if res.status_code == 200:
@@ -98,34 +99,36 @@ async def search_searxng(query: str) -> tuple[str | None, float]:
 async def classify_merchant(ctx: Any, description: str) -> dict[str, Any]:
     """
     Multi-tier local classifier:
-    1. Built-in Deterministic Dictionary (Fastest, 100% offline)
-    2. Household Database Category Rules (`category_rules`)
+    1. Household Database Category Rules (`category_rules`), including CNPJ
+    2. Built-in Deterministic Dictionary (Fastest, 100% offline)
     3. Local SearXNG Web Enrichment (Local Fallback)
     4. Default fallback ("Outros")
     """
     desc_norm = normalize(description)
     
-    # 1. Deterministic Known Patterns
-    for category_name, patterns in KNOWN_MERCHANT_PATTERNS.items():
-        for pat in patterns:
-            pat_norm = normalize(pat)
-            if re.search(r"(?<!\w)" + re.escape(pat_norm) + r"(?!\w)", desc_norm):
-                return {
-                    "category_name": category_name,
-                    "category_id": None,
-                    "confidence": 0.98,
-                    "source": "known_brand_rule"
-                }
-
-    # 2. Database Category Rules
+    # A family rule must take precedence over a generic brand guess. CNPJ
+    # punctuation is irrelevant, but a partial number must never match.
     if ctx and hasattr(ctx, "conn"):
         try:
-            db_categories = {c["id"]: c["name"] for c in await rows(ctx, "categories")}
-            for rule in await rows(ctx, "category_rules"):
-                if not rule["enabled"] or rule["category_id"] not in db_categories:
+            db_categories = {
+                c["id"]: c["name"] for c in await rows(ctx, "categories")
+                if c["kind"] == "EXPENSE" and not c["archived_at"]
+            }
+            cnpj_candidates = {
+                re.sub(r"\D", "", match.group(0))
+                for match in re.finditer(r"(?<!\d)\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}(?!\d)", description)
+            }
+            rules = sorted(await rows(ctx, "category_rules"), key=lambda r: r["priority"], reverse=True)
+            for rule in rules:
+                if (not rule["enabled"] or rule["category_id"] not in db_categories
+                    or rule["user_id"] not in (None, getattr(ctx, "user_id", None))):
                     continue
                 rule_pat = normalize(rule["pattern"])
-                matched = (desc_norm == rule_pat) if rule["match_type"] == "EXACT" else (rule_pat in desc_norm)
+                cnpj_digits = re.sub(r"\D", "", rule["pattern"])
+                if len(cnpj_digits) == 14:
+                    matched = cnpj_digits in cnpj_candidates
+                else:
+                    matched = (desc_norm == rule_pat) if rule["match_type"] == "EXACT" else (rule_pat in desc_norm)
                 if matched:
                     return {
                         "category_name": db_categories[rule["category_id"]],
@@ -135,6 +138,14 @@ async def classify_merchant(ctx: Any, description: str) -> dict[str, Any]:
                     }
         except Exception:
             pass
+
+    # Generic merchant names are suggestions only; the user sees them before import.
+    for category_name, patterns in KNOWN_MERCHANT_PATTERNS.items():
+        for pat in patterns:
+            pat_norm = normalize(pat)
+            if re.search(r"(?<!\w)" + re.escape(pat_norm) + r"(?!\w)", desc_norm):
+                return {"category_name": category_name, "category_id": None,
+                        "confidence": 0.8, "source": "known_brand_rule"}
 
     # 3. SearXNG Fallback Enrichment
     searx_cat, confidence = await search_searxng(description)
