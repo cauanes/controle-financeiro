@@ -10,8 +10,11 @@ from redis.exceptions import RedisError
 from app.core.config import settings
 from app.core.db import emit, get, insert, make_pool, system_context, update
 from app.core.errors import DomainError
+from app.modules.categorization.merchant_classifier import classify_merchant
 from app.modules.conversations.service import process, response
 from app.modules.ingestion.audio import HttpTranscriptionProvider
+from app.modules.ingestion.invoice_parser import parse_invoice
+from app.modules.ingestion.ocr import extract_text_from_image
 from app.modules.integrations.evolution import EvolutionAdapter
 
 logger = logging.getLogger("finance.worker")
@@ -68,28 +71,151 @@ async def handle(pool, scope, event, transcriber=None, channel=None):
                 )
                 await event_done(ctx, event)
                 return
-            await update(ctx, "conversation_messages", message["id"], {"processing_status": "TRANSCRIBING"})
-        audio, mime = await channel.media(integration["instance_key"], message["media"])
-        transcription = await transcriber.transcribe(audio, mime)
-        del audio
-        async with system_context(pool, **scope) as ctx:
-            current = await get(ctx, "conversation_messages", message["id"])
-            if current["processing_status"] not in ("READY", "PROCESSED", "FAILED"):
-                await update(
-                    ctx,
-                    "conversation_messages",
-                    message["id"],
-                    {
-                        "normalized_text": transcription.text,
-                        "transcription_metadata": {
-                            k: v for k, v in asdict(transcription).items() if k != "text"
+            if message["kind"] == "IMAGE":
+                await update(ctx, "conversation_messages", message["id"], {"processing_status": "PROCESSING_OCR"})
+            else:
+                await update(ctx, "conversation_messages", message["id"], {"processing_status": "TRANSCRIBING"})
+
+        if message["kind"] == "IMAGE":
+            img_bytes, mime = await channel.media(integration["instance_key"], message["media"])
+            ocr_text = extract_text_from_image(img_bytes, mime)
+            del img_bytes
+
+            async with system_context(pool, **scope) as ctx:
+                current = await get(ctx, "conversation_messages", message["id"])
+                if current["processing_status"] in ("READY", "PROCESSED", "FAILED"):
+                    await event_done(ctx, event)
+                    return
+
+                invoice = parse_invoice(ocr_text)
+
+                # Classify transactions
+                classified_txs = []
+                for tx in invoice.transactions:
+                    cat_info = await classify_merchant(ctx, tx.description)
+                    tx_dict = asdict(tx)
+                    tx_dict["category_name"] = cat_info["category_name"]
+                    tx_dict["category_id"] = cat_info.get("category_id")
+                    if tx.card:
+                        tx_dict["card"] = asdict(tx.card)
+                    classified_txs.append(tx_dict)
+
+                # Look for matching card in DB
+                cards = await ctx.conn.fetch("SELECT * FROM credit_cards WHERE archived_at IS NULL")
+                matched_card = None
+                for c in cards:
+                    c_name_l = c["name"].lower()
+                    if invoice.summary.issuer and (c_name_l in invoice.summary.issuer.lower() or invoice.summary.issuer.lower() in c_name_l):
+                        matched_card = c
+                        break
+                    for tx in invoice.transactions:
+                        if tx.card and tx.card.last4 and tx.card.last4 in c_name_l:
+                            matched_card = c
+                            break
+                if not matched_card and cards:
+                    matched_card = cards[0]
+
+                card_name = matched_card["name"] if matched_card else (invoice.summary.issuer or "Cartão de Crédito")
+                has_invoice_data = bool(invoice.summary.total_amount or len(classified_txs) > 0 or invoice.summary.issuer)
+
+                if has_invoice_data and len(classified_txs) > 0:
+                    session = await get(ctx, "conversation_sessions", message["session_id"])
+                    issuer_title = invoice.summary.issuer or "Fatura de Cartão"
+                    lines = [f"📄 *Fatura identificada: {issuer_title}*"]
+                    if invoice.summary.total_amount:
+                        lines.append(f"💰 *Total da fatura:* R$ {invoice.summary.total_amount:.2f}")
+                    if invoice.summary.due_date:
+                        due_fmt = datetime.strptime(invoice.summary.due_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+                        clos_fmt = (
+                            datetime.strptime(invoice.summary.closing_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+                            if invoice.summary.closing_date
+                            else "-"
+                        )
+                        lines.append(f"🗓️ *Vencimento:* {due_fmt} | *Fechamento:* {clos_fmt}")
+                    if invoice.summary.available_limit and invoice.summary.total_limit:
+                        lines.append(
+                            f"💳 *Limite:* R$ {invoice.summary.available_limit:.2f} disp. de R$ {invoice.summary.total_limit:.2f}"
+                        )
+
+                    lines.append(f"\n📊 *Lançamentos identificados ({len(classified_txs)} itens):*")
+                    for i, t in enumerate(classified_txs[:10], 1):
+                        dt_str = (
+                            datetime.strptime(t["date"], "%Y-%m-%d").strftime("%d/%m")
+                            if t.get("date")
+                            else "Sem data"
+                        )
+                        inst_str = (
+                            f" ({t['installment_current']}/{t['installment_total']})"
+                            if t.get("installment_total")
+                            else ""
+                        )
+                        lines.append(f"{i}. {dt_str} · {t['description']} · R$ {t['amount']:.2f}{inst_str} ➔ {t['category_name']}")
+                    if len(classified_txs) > 10:
+                        lines.append(f"... e mais {len(classified_txs) - 10} lançamentos.")
+
+                    lines.append(f"\n_Deseja importar estes lançamentos no cartão *{card_name}*?_")
+                    lines.append("Responda *sim* para confirmar ou *cancelar*.")
+                    question_text = "\n".join(lines)
+
+                    now = datetime.now(timezone.utc)
+                    action = await insert(
+                        ctx,
+                        "pending_financial_actions",
+                        {
+                            "session_id": session["id"],
+                            "user_id": session["user_id"],
+                            "intent": "IMPORT_INVOICE",
+                            "raw_message": ocr_text,
+                            "extracted_data": {
+                                "schema_version": 1,
+                                "summary": asdict(invoice.summary),
+                                "transactions": classified_txs,
+                                "matched_card_id": str(matched_card["id"]) if matched_card else None,
+                                "matched_card_name": card_name,
+                                "issuer": invoice.summary.issuer,
+                            },
+                            "status": "WAITING_CONFIRMATION",
+                            "question": question_text,
+                            "expires_at": now + timedelta(hours=24),
+                            "confirmation_prompt_message_id": message["id"],
                         },
-                        "media": None,
-                        "processing_status": "READY",
-                    },
-                )
-                await emit(ctx, "ProcessMessage", message["id"])
-            await event_done(ctx, event)
+                    )
+                    await response(ctx, session, message, action, question_text)
+                else:
+                    await update(
+                        ctx,
+                        "conversation_messages",
+                        message["id"],
+                        {
+                            "normalized_text": ocr_text,
+                            "media": None,
+                            "processing_status": "READY",
+                        },
+                    )
+                    await emit(ctx, "ProcessMessage", message["id"])
+                await event_done(ctx, event)
+        else:
+            audio, mime = await channel.media(integration["instance_key"], message["media"])
+            transcription = await transcriber.transcribe(audio, mime)
+            del audio
+            async with system_context(pool, **scope) as ctx:
+                current = await get(ctx, "conversation_messages", message["id"])
+                if current["processing_status"] not in ("READY", "PROCESSED", "FAILED"):
+                    await update(
+                        ctx,
+                        "conversation_messages",
+                        message["id"],
+                        {
+                            "normalized_text": transcription.text,
+                            "transcription_metadata": {
+                                k: v for k, v in asdict(transcription).items() if k != "text"
+                            },
+                            "media": None,
+                            "processing_status": "READY",
+                        },
+                    )
+                    await emit(ctx, "ProcessMessage", message["id"])
+                await event_done(ctx, event)
     elif kind == "SendMessage":
         async with system_context(pool, **scope) as ctx:
             outgoing = await get(ctx, "outgoing_messages", event["aggregate_id"])

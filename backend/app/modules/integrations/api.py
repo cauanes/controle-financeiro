@@ -227,7 +227,15 @@ async def webhook(request: Request):
         or message.get("templateButtonReplyMessage", {}).get("selectedId")
     )
     audio = message.get("audioMessage")
-    if not text and not audio:
+    image = message.get("imageMessage")
+    doc = message.get("documentMessage")
+    if doc and (
+        doc.get("mimetype", "").startswith("image/")
+        or (doc.get("fileName") or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+    ):
+        image = doc
+
+    if not text and not audio and not image:
         return Response(status_code=204)
     require(text is None or isinstance(text, str) and len(text) <= 8000, "Texto inválido.")
     async with request.app.state.pool.acquire() as conn, conn.transaction():
@@ -347,13 +355,19 @@ async def webhook(request: Request):
             if not has_pending and (not text or intent(text) == "UNKNOWN"):
                 return Response(status_code=204)
         session = await ensure_session(ctx, dict(identity), dict(group) if group else None)
-        media = (
-            {"key": key, "mime_type": audio.get("mimetype", "audio/ogg"), "duration": audio.get("seconds")}
-            if audio
-            else None
-        )
+        media = None
+        kind = "TEXT"
+        if audio:
+            kind = "AUDIO"
+            media = {"key": key, "mime_type": audio.get("mimetype", "audio/ogg"), "duration": audio.get("seconds")}
+        elif image:
+            kind = "IMAGE"
+            media = {"key": key, "mime_type": image.get("mimetype", "image/jpeg"), "caption": image.get("caption")}
+            if image.get("caption") and not text:
+                text = image.get("caption")
+
         incoming = await receive(
-            ctx, session, text, event_key, kind="AUDIO" if audio else "TEXT", media=media
+            ctx, session, text, event_key, kind=kind, media=media
         )
         await insert(
             ctx,
@@ -366,5 +380,5 @@ async def webhook(request: Request):
                 "status": "RECEIVED",
             },
         )
-        await emit(ctx, "NormalizeMessage" if audio else "ProcessMessage", incoming["id"])
+        await emit(ctx, "NormalizeMessage" if (audio or image) else "ProcessMessage", incoming["id"])
     return Response(status_code=202)

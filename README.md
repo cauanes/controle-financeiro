@@ -28,6 +28,8 @@ A integração precisa de uma instância Evolution conectada e de webhook autent
 
 Para receitas, o bot usa os vínculos entre membro e atividade em `GET/POST /api/v1/income-activities`. Uma frase como `Recebi 770 Paciente Alice` pode sugerir Psicologia, mas o bot pergunta se a receita pertence à Carla ou ao Cauan quando ambos exercem essa atividade. Ele pede conta ou outra informação ausente e sempre mostra pessoa, atividade, valor, conta, data e descrição para confirmação antes de criar a transação.
 
+Esses vínculos aparecem em **Configurações → Atividades de receita**. No WhatsApp, as perguntas oferecem opções numeradas (`1`, `2`...) e aceitam também o nome; na tela **Conversar**, as opções são botões clicáveis. A instância atual usa Evolution 2.3.7 com Baileys 7.0.0-rc.9, combinação com relatos de falha em botões nativos; veja o [guia do grupo](docs/runbooks/WHATSAPP_GROUP.md).
+
 O áudio requer um serviço de transcrição configurado em `TRANSCRIPTION_URL`. Sem ele, o usuário pode continuar por texto. Conectores Open Finance não estão ativos nesta versão.
 
 ## Documentação

@@ -266,7 +266,7 @@ class RuleParser:
                 fields["merchant_id"] = evidence(str(merchant["id"]))
         if contains(norm, "amazon") and "category_id" not in fields:
             candidate["merchant_hint"] = "Amazon"
-        if kind == "INCOME" and income_profiles:
+        if kind == "INCOME":
             members = await ctx.conn.fetch(
                 "SELECT m.user_id,u.display_name FROM household_members m JOIN users u ON u.id=m.user_id WHERE m.status='ACTIVE'"
             )
@@ -279,44 +279,45 @@ class RuleParser:
                 fields.pop("responsible_user_id", None)
                 candidate["ambiguous_fields"].append("responsible_user_id")
 
-            categories = {
-                c["id"]: c for c in await rows(ctx, "categories")
-                if c["kind"] == "INCOME" and not c["archived_at"]
-            }
+            if income_profiles:
+                categories = {
+                    c["id"]: c for c in await rows(ctx, "categories")
+                    if c["kind"] == "INCOME" and not c["archived_at"]
+                }
 
-            def matching_activities(phrase):
-                return {
-                    str(profile["category_id"])
+                def matching_activities(phrase):
+                    return {
+                        str(profile["category_id"])
+                        for profile in income_profiles
+                        if profile["category_id"] in categories
+                        and any(
+                            contains(phrase, word)
+                            for word in (categories[profile["category_id"]]["name"], *profile["keywords"])
+                        )
+                    }
+
+                activities = matching_activities(text)
+                if not activities and answer_field != "category_id":
+                    activities = matching_activities(candidate.get("original_text", ""))
+                if len(activities) == 1:
+                    fields["category_id"] = evidence(next(iter(activities)), "income_activity_hint")
+                elif len(activities) > 1:
+                    fields.pop("category_id", None)
+                    candidate["ambiguous_fields"].append("category_id")
+
+                person = fields.get("responsible_user_id", {}).get("value")
+                category = fields.get("category_id", {}).get("value")
+                if category and person and not any(
+                    str(profile["user_id"]) == person and str(profile["category_id"]) == category
                     for profile in income_profiles
-                    if profile["category_id"] in categories
-                    and any(
-                        contains(phrase, word)
-                        for word in (categories[profile["category_id"]]["name"], *profile["keywords"])
-                    )
-                }
-
-            activities = matching_activities(text)
-            if not activities and answer_field != "category_id":
-                activities = matching_activities(candidate.get("original_text", ""))
-            if len(activities) == 1:
-                fields["category_id"] = evidence(next(iter(activities)), "income_activity_hint")
-            elif len(activities) > 1:
-                fields.pop("category_id", None)
-                candidate["ambiguous_fields"].append("category_id")
-
-            person = fields.get("responsible_user_id", {}).get("value")
-            category = fields.get("category_id", {}).get("value")
-            if category and person and not any(
-                str(profile["user_id"]) == person and str(profile["category_id"]) == category
-                for profile in income_profiles
-            ):
-                fields.pop("category_id", None)
-                candidate["ambiguous_fields"].append("category_id")
-            if category and not person:
-                owners = {
-                    str(profile["user_id"])
-                    for profile in income_profiles if str(profile["category_id"]) == category
-                }
-                if len(owners) == 1:
-                    fields["responsible_user_id"] = evidence(next(iter(owners)), "income_activity_hint")
+                ):
+                    fields.pop("category_id", None)
+                    candidate["ambiguous_fields"].append("category_id")
+                if category and not person:
+                    owners = {
+                        str(profile["user_id"])
+                        for profile in income_profiles if str(profile["category_id"]) == category
+                    }
+                    if len(owners) == 1:
+                        fields["responsible_user_id"] = evidence(next(iter(owners)), "income_activity_hint")
         return candidate

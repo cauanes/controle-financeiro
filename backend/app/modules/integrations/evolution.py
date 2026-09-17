@@ -1,10 +1,12 @@
+import base64
 from urllib.parse import quote, urlparse
 
 import httpx
 
 from app.core.config import settings
-from app.core.errors import require
+from app.core.errors import DomainError, require
 from app.modules.ingestion.audio import MAX_BYTES, decode_audio
+from app.modules.ingestion.ocr import MAX_IMAGE_BYTES, validate_image
 
 
 class EvolutionAdapter:
@@ -36,16 +38,24 @@ class EvolutionAdapter:
                 headers=self.headers,
                 json={"message": {"key": message["key"]}, "convertToMp4": False},
             ) as res:
-                require(res.is_success, "Falha ao baixar áudio.", "MEDIA_FAILED", 503)
+                require(res.is_success, "Falha ao baixar mídia.", "MEDIA_FAILED", 503)
                 chunks = bytearray()
                 async for chunk in res.aiter_bytes():
                     chunks.extend(chunk)
-                    require(len(chunks) <= MAX_BYTES * 2, "Mídia excede limite.")
+                    require(len(chunks) <= max(MAX_BYTES, MAX_IMAGE_BYTES) * 2, "Mídia excede limite.")
                 import json
 
                 body = json.loads(chunks)
-        mime = body.get("mimetype") or message.get("mime_type", "audio/ogg")
-        return decode_audio(body.get("base64", ""), mime, message.get("duration")), mime
+        mime = body.get("mimetype") or message.get("mime_type", "")
+        raw_b64 = body.get("base64", "")
+        if mime.startswith("image/"):
+            try:
+                data = base64.b64decode(raw_b64)
+            except Exception:
+                raise DomainError("Imagem codificada inválida.")
+            valid_mime = validate_image(data, mime)
+            return data, valid_mime
+        return decode_audio(raw_b64, mime or "audio/ogg", message.get("duration")), mime or "audio/ogg"
 
     async def send(self, instance, recipient, text):
         self.configured()

@@ -26,6 +26,8 @@ Revisão lado a lado no desktop e empilhada no celular: WhatsApp/manual versus e
 
 Pendências ficam em atividade/central de revisão com pergunta atual, prazo e ações responder/cancelar. Confirmação exibe resumo persistido, sem converter sugestão em sucesso otimista. Faturas mostram compras, parcelas, pagamentos e saldo restante. Calendário distingue previsto de pago. Metas distinguem alocação de movimentação. Diagnóstico apresenta quatro blocos com fórmulas acessíveis e qualidade dos dados, sem score geral.
 
+Em **Configurações → Atividades de receita**, a família vincula cada categoria de trabalho à pessoa que recebe e pode informar palavras de reconhecimento. Em **Conversar**, a pergunta pendente apresenta opções clicáveis; o aplicativo envia a mesma resposta numerada aceita no WhatsApp. O resumo de uma receita só pode aparecer como registrado depois da confirmação e da resposta da API.
+
 ## Estado, acessibilidade e validação
 
 Tipos derivados do OpenAPI; valores monetários permanecem strings até formatação, sem usar Number para cálculo financeiro. Cache de consultas inclui household e filtros; trocar família limpa dados anteriores imediatamente. Requisições são canceladas/descartadas se contexto mudar. Nenhuma confirmação financeira usa atualização otimista que mostre sucesso antes da API.

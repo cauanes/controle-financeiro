@@ -98,12 +98,14 @@ async def receive(
 
 
 async def response(ctx, session, message, action, text, result=None):
+    choices = action.get("extracted_data", {}).get("choice_options", []) if action and action["status"] in ACTIVE else []
     payload = {
         "action_id": str(action["id"]) if action else None,
         "status": action["status"] if action else "ANSWERED",
         "question": text,
         "execution_result": wire(result) if result else None,
         "version": action["version"] if action else None,
+        "choices": [{"label": option["label"], "value": str(index)} for index, option in enumerate(choices, 1)],
     }
     await update(
         ctx,
@@ -153,6 +155,96 @@ async def complete(ctx, action):
         from app.modules.planning.service import create_budget
 
         result = await create_budget(ctx, Budget.model_validate(candidate["budget"]))
+    elif action["intent"] == "IMPORT_INVOICE":
+        card_id = candidate.get("matched_card_id")
+        if card_id:
+            card = await get(ctx, "credit_cards", card_id)
+        else:
+            summary_info = candidate.get("summary") or {}
+            card_name = candidate.get("matched_card_name") or candidate.get("issuer") or "Cartão de Crédito"
+            due_day = 10
+            closing_day = 1
+            if summary_info.get("due_date"):
+                try:
+                    due_day = int(summary_info["due_date"].split("-")[2])
+                except Exception:
+                    pass
+            if summary_info.get("closing_date"):
+                try:
+                    closing_day = int(summary_info["closing_date"].split("-")[2])
+                except Exception:
+                    pass
+            limit_amt = summary_info.get("total_limit") or 5000.0
+            card = await insert(
+                ctx,
+                "credit_cards",
+                {
+                    "name": card_name,
+                    "issuer": candidate.get("issuer") or card_name,
+                    "limit_amount": limit_amt,
+                    "closing_day": closing_day,
+                    "due_day": due_day,
+                },
+            )
+            await audit(ctx, "CREATE", "credit_cards", card)
+            card_id = str(card["id"])
+
+        categories = {c["name"].lower(): c["id"] for c in await rows(ctx, "categories") if c["kind"] == "EXPENSE"}
+
+        async def get_or_create_category(cat_name: str) -> UUID:
+            cat_l = (cat_name or "Outros").lower()
+            if cat_l in categories:
+                return categories[cat_l]
+            new_cat = await insert(
+                ctx,
+                "categories",
+                {"name": cat_name or "Outros", "kind": "EXPENSE"},
+            )
+            await audit(ctx, "CREATE", "categories", new_cat)
+            categories[cat_l] = new_cat["id"]
+            return new_cat["id"]
+
+        created_txs = []
+        now_date = ctx.today()
+        for idx, t in enumerate(candidate.get("transactions", [])):
+            if t.get("type") == "PAYMENT_OR_CREDIT":
+                continue
+
+            tx_date = now_date
+            if t.get("date"):
+                try:
+                    tx_date = datetime.strptime(t["date"], "%Y-%m-%d").date()
+                except Exception:
+                    pass
+
+            cat_id = await get_or_create_category(t.get("category_name", "Outros"))
+            tx_data = {
+                "type": "EXPENSE",
+                "amount": float(t["amount"]),
+                "description": t["description"],
+                "transaction_date": tx_date.isoformat(),
+                "financial_source": {
+                    "kind": "CREDIT_CARD",
+                    "id": card_id,
+                },
+                "category_id": str(cat_id),
+                "installment_count": 1,
+            }
+            body = Transaction.model_validate(tx_data)
+            created = await ledger.create(
+                ctx,
+                body,
+                source_type="INVOICE_OCR",
+                source_key=f"invoice:{action['id']}:{idx}",
+            )
+            created_txs.append(created)
+
+        result = {
+            "imported_count": len(created_txs),
+            "card_id": str(card_id),
+            "card_name": card["name"],
+            "transactions": [str(c[0]["id"]) if isinstance(c, list) else str(c["id"]) for c in created_txs],
+        }
     else:
         values = {k: v["value"] for k, v in candidate["fields"].items() if k in Transaction.model_fields}
         values["description"] = values.get("description", "Lançamento conversacional")
@@ -458,6 +550,9 @@ async def process(ctx, session, message):
                         "O lançamento mudou desde a proposta. Solicite a correção novamente.",
                     )
             action, result = await complete(ctx, action)
+            if action["intent"] == "IMPORT_INVOICE":
+                msg = f"✅ *{result['imported_count']} lançamentos* da fatura importados com sucesso no cartão *{result['card_name']}*!"
+                return await response(ctx, session, message, action, msg, result)
             return await response(
                 ctx, session, message, action, "✅ Operação confirmada e registrada.", result
             )

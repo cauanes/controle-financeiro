@@ -13,7 +13,10 @@ from app.core.config import settings
 from app.core.db import audit, emit, get, idempotent, insert, rows, update, wire
 from app.core.errors import require
 from app.core.schemas import Patch, Strict, Transaction, Version
+from app.modules.categorization.merchant_classifier import classify_merchant
 from app.modules.ingestion import imports
+from app.modules.ingestion.invoice_parser import parse_invoice
+from app.modules.ingestion.ocr import extract_text_from_image
 from app.modules.reconciliation import service as reconciliation
 
 router = APIRouter(prefix="/api/v1", tags=["imports"])
@@ -72,6 +75,48 @@ async def upload(ctx: Ctx, file: UploadFile = File()):
         (base / ref).unlink(missing_ok=True)
         raise
     return wire(job | {"headers": headers, "sample": records[:5]})
+
+
+@router.post("/imports/invoice-image")
+async def process_invoice_image(ctx: Ctx, file: UploadFile = File()):
+    data = await file.read(20 * 1024 * 1024 + 1)
+    ocr_text = extract_text_from_image(data, file.content_type)
+    invoice = parse_invoice(ocr_text)
+    
+    classified_txs = []
+    for tx in invoice.transactions:
+        cat_info = await classify_merchant(ctx, tx.description)
+        tx_dict = {
+            "date": tx.date,
+            "description": tx.description,
+            "amount": tx.amount,
+            "type": tx.type,
+            "installment_current": tx.installment_current,
+            "installment_total": tx.installment_total,
+            "card": {
+                "type": tx.card.type,
+                "last4": tx.card.last4,
+                "holder": tx.card.holder
+            } if tx.card else None,
+            "category_name": cat_info["category_name"],
+            "category_id": cat_info.get("category_id"),
+            "confidence": cat_info.get("confidence", 0.9)
+        }
+        classified_txs.append(tx_dict)
+        
+    return {
+        "summary": {
+            "total_amount": invoice.summary.total_amount,
+            "due_date": invoice.summary.due_date,
+            "closing_date": invoice.summary.closing_date,
+            "available_limit": invoice.summary.available_limit,
+            "total_limit": invoice.summary.total_limit,
+            "paid_amount": invoice.summary.paid_amount,
+            "issuer": invoice.summary.issuer
+        },
+        "transactions": classified_txs,
+        "raw_text": ocr_text
+    }
 
 
 @router.get("/imports")
