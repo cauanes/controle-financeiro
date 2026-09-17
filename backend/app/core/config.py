@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     transcription_url: str = ""
     transcription_api_key: str = ""
     transcription_model: str = ""
+    searxng_url: str = ""
 
     def validate_runtime(self):
         if self.environment == "production" and not self.cookie_secure:

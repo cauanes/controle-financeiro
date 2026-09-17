@@ -132,6 +132,26 @@ async def test_merchant_classification_known_rules():
     assert c_iof["category_name"] == "Tarifas e Juros"
 
 
+@pytest.mark.asyncio
+async def test_household_cnpj_rule_overrides_generic_brand(monkeypatch):
+    from app.modules.categorization import merchant_classifier
+
+    class Context:
+        conn = object()
+        user_id = "family-member"
+
+    async def fake_rows(ctx, table):
+        if table == "categories":
+            return [{"id": "food", "name": "Alimentação", "kind": "EXPENSE", "archived_at": None}]
+        return [{"enabled": True, "category_id": "food", "user_id": None, "priority": 10,
+                 "pattern": "12.345.678/0001-90", "match_type": "EXACT", "confidence": 0.95}]
+
+    monkeypatch.setattr(merchant_classifier, "rows", fake_rows)
+    result = await classify_merchant(Context(), "SAMS CLUB CNPJ 12345678000190")
+    assert result["category_name"] == "Alimentação"
+    assert result["source"] == "db_category_rule"
+
+
 def test_ocr_on_real_invoices():
     img_files = sorted(glob.glob(".local/invoices/*.jpg"))
     if not img_files:
@@ -149,6 +169,8 @@ def test_merge_classified_transactions():
     from app.workers.runner import (
         build_invoice_header_text,
         build_invoice_question_text,
+        invoice_summary_conflict,
+        match_credit_card,
         merge_classified_transactions,
     )
 
@@ -166,6 +188,19 @@ def test_merge_classified_transactions():
     assert merged[0]["description"] == "SAMS CLUB"
     assert merged[1]["description"] == "POSTO IPIRANGA"
     assert merged[2]["description"] == "UBER *TRIP"
+    assert len(merge_classified_transactions(
+        [{"description": "63 Vindi *Quindim", "amount": 60.80, "date": "2026-09-16"}],
+        [{"description": "Go Vindi *Quindim", "amount": 60.80, "date": "2026-09-16"}],
+    )) == 1
+    assert not invoice_summary_conflict({"total_amount": 2376.31}, {"closing_date": "2026-10-01"})
+    assert invoice_summary_conflict({"closing_date": "2026-10-01"}, {"closing_date": "2026-11-01"})
+    assert invoice_summary_conflict({"total_amount": 2376.31}, {"total_amount": 1800.00})
+    family_cards = [
+        {"name": "Nubank Cauan 1234", "issuer": "Nubank"},
+        {"name": "Nubank Carla 5678", "issuer": "Nubank"},
+    ]
+    assert match_credit_card(family_cards, "Nubank", set()) == (None, True)
+    assert match_credit_card(family_cards, "Nubank", {"5678"}) == (family_cards[1], False)
 
     summary = {
         "issuer": "Sam's Club",
@@ -181,10 +216,54 @@ def test_merge_classified_transactions():
     assert "SAMS CLUB" in q_text
     assert "POSTO IPIRANGA" in q_text
     assert "UBER *TRIP" in q_text
-    assert "Deseja importar estes lançamentos" in q_text
+    assert "Apenas os itens listados acima serão importados" in q_text
 
     h_text = build_invoice_header_text(summary, "Sam's Club")
     assert "Sam's Club" in h_text
     assert "203.90" in h_text
-    assert "Envie os prints com a lista de compras" in h_text
+    assert "Ainda não importei nada" in h_text
+
+
+def test_ocr_lines_do_not_guess_missing_decimal_separator():
+    text = """Fatura\nValor atual\nR$ 2.376,31\nQuarta-feira, 16 de setembro
+Parcele Fácil\nR$ 700,89\nParcela 1/4\nHAPPY SALGADOS\nR$ 252773
+Pagamento de Fatura via PIX\nR$ 1.000,00"""
+    result = parse_invoice(text, default_year=2026)
+    assert result.summary.total_amount == 2376.31
+    assert [(item.description, item.amount) for item in result.transactions if item.type != "PAYMENT_OR_CREDIT"] == [
+        ("Parcele Fácil", 700.89)
+    ]
+
+
+def test_parse_caixa_invoice():
+    sample_text = """
+    Final 4804
+    CAIXA ELO GRAFITE INTERN DUAL
+    A vencer
+    Total da fatura RS 884,12
+    Final 4804 - CAUAN ESPLUGUES SILVA
+    MOVIMENTAÇÃO NACIONAL R$ 884,12
+    03/09 PG PL RECANTO SALTO R$ 209,80
+    03/09 IFD 60473794 MAIRCE SI R$ 0,90
+    03/09 AUTO POSTO NOSSA SENH R$ 28,50
+    04/09 RM CINE PIZZA BODYBUIL R$ 115,50
+    04/09 AUTO POSTO NOSSA SENH R$ 318,73
+    05/09 Zet R$ 12,50
+    06/09 AMAZON BR R$ 67,85
+    06/09 KALUNGA COM R$ 60,74
+    07/09 BURGER KING R$ 57,70
+    07/09 DL GOOGLE Micros R$ 11,90
+    TOTAL NACIONAL RS 884,12
+    TOTAL INTERNACIONAL RS 0,00
+    """
+    res = parse_invoice(sample_text, default_year=2026)
+    assert res.summary.issuer == "Caixa Econômica"
+    assert res.summary.total_amount == 884.12
+    assert len(res.transactions) == 10
+    assert sum(t.amount for t in res.transactions) == 884.12
+    assert res.transactions[0].date == "2026-09-03"
+    assert res.transactions[0].description == "PG PL RECANTO SALTO"
+    assert res.transactions[0].amount == 209.80
+    assert res.transactions[0].card.last4 == "4804"
+    assert res.transactions[0].card.holder == "CAUAN ESPLUGUES SILVA"
 

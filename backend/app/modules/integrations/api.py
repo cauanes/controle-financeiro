@@ -14,7 +14,7 @@ from app.core.db import Context, audit, digest, emit, get, insert, rows, set_sco
 from app.core.errors import require
 from app.core.schemas import Strict, Version
 from app.modules.conversations.parser import intent
-from app.modules.conversations.service import ensure_session, receive
+from app.modules.conversations.service import ensure_session, receive, response
 from app.modules.integrations.evolution import EvolutionAdapter
 
 router = APIRouter(tags=["integrations"])
@@ -217,6 +217,17 @@ async def webhook(request: Request):
     if not from_me and not isinstance(sender, str):
         return Response(status_code=204)
     message = data.get("message", {})
+    for _ in range(4):
+        wrapped = next(
+            (message[key].get("message") for key in (
+                "ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "documentWithCaptionMessage"
+            ) if isinstance(message, dict) and isinstance(message.get(key), dict)
+             and isinstance(message[key].get("message"), dict)),
+            None,
+        )
+        if wrapped is None:
+            break
+        message = wrapped
     if not isinstance(message, dict):
         return Response(status_code=204)
     text = (
@@ -234,8 +245,13 @@ async def webhook(request: Request):
         or (doc.get("fileName") or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
     ):
         image = doc
+    image_message_type = "documentMessage" if image is doc and doc else "imageMessage"
 
-    if not text and not audio and not image:
+    unsupported_media = next(
+        (kind for kind in ("documentMessage", "videoMessage", "stickerMessage") if message.get(kind)),
+        None,
+    )
+    if not text and not audio and not image and not (is_group and unsupported_media):
         return Response(status_code=204)
     require(text is None or isinstance(text, str) and len(text) <= 8000, "Texto inválido.")
     async with request.app.state.pool.acquire() as conn, conn.transaction():
@@ -355,14 +371,33 @@ async def webhook(request: Request):
             if not has_pending and (not text or intent(text) == "UNKNOWN"):
                 return Response(status_code=204)
         session = await ensure_session(ctx, dict(identity), dict(group) if group else None)
+        if unsupported_media and not text and not audio and not image:
+            incoming = await receive(ctx, session, "[mídia não suportada]", event_key)
+            await insert(ctx, "webhook_receipts", {
+                "integration_id": iid, "provider_event_key": event_key,
+                "payload_hash": hashlib.sha256(data_bytes).hexdigest(),
+                "message_id": incoming["id"], "status": "RECEIVED",
+            })
+            await response(
+                ctx, session, incoming, None,
+                "Recebi o arquivo, mas ainda não leio PDF, vídeo ou figurinha neste fluxo. "
+                "Envie uma foto ou print JPG/PNG/WebP da fatura, ou descreva o gasto por texto. Nada foi importado.",
+            )
+            return Response(status_code=202)
         media = None
         kind = "TEXT"
         if audio:
             kind = "AUDIO"
-            media = {"key": key, "mime_type": audio.get("mimetype", "audio/ogg"), "duration": audio.get("seconds")}
+            media = {
+                "key": key, "message": {"audioMessage": audio},
+                "mime_type": audio.get("mimetype", "audio/ogg"), "duration": audio.get("seconds"),
+            }
         elif image:
             kind = "IMAGE"
-            media = {"key": key, "mime_type": image.get("mimetype", "image/jpeg"), "caption": image.get("caption")}
+            media = {
+                "key": key, "message": {image_message_type: image},
+                "mime_type": image.get("mimetype", "image/jpeg"), "caption": image.get("caption"),
+            }
             if image.get("caption") and not text:
                 text = image.get("caption")
 

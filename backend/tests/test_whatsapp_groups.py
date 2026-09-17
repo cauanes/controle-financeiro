@@ -73,11 +73,16 @@ async def test_group_creation_routes_participant_and_ignores_chatter(client, fam
             destinations.append((recipient, text))
             return "outbound-id"
 
+        async def media(self, instance, message):
+            assert "imageMessage" in message["message"]
+            return b"image-bytes", "image/jpeg"
+
     for _ in range(16):
         await tick(family["pool"], channel=Channel())
     transactions = (await client.get("/api/v1/transactions")).json()["data"]
     assert len(transactions) == 1
-    assert [destination for destination, _ in destinations] == [group_jid]
+    assert [destination for destination, _ in destinations] == [group_jid, group_jid]
+    assert "Não entendi o pedido" in destinations[0][1]
     assert (await client.get("/api/v1/conversations")).json()["data"][0]["whatsapp_group_id"] == group.json()[
         "id"
     ]
@@ -91,7 +96,7 @@ async def test_group_creation_routes_participant_and_ignores_chatter(client, fam
     assert (await client.post("/webhooks/evolution", json=own_message, headers=headers)).status_code == 202
     for _ in range(16):
         await tick(family["pool"], channel=Channel())
-    assert [destination for destination, _ in destinations] == [group_jid, group_jid]
+    assert [destination for destination, _ in destinations] == [group_jid] * 3
 
     bot_echo = event(destinations[-1][1], "outbound-id", group=True)
     bot_echo["data"]["key"].update({"fromMe": True, "participant": "12345@lid"})
@@ -107,7 +112,7 @@ async def test_group_creation_routes_participant_and_ignores_chatter(client, fam
     assert (await client.post("/webhooks/evolution", json=linked_lid, headers=headers)).status_code == 202
     for _ in range(16):
         await tick(family["pool"], channel=Channel())
-    assert [destination for destination, _ in destinations] == [group_jid, group_jid, group_jid]
+    assert [destination for destination, _ in destinations] == [group_jid] * 4
 
     income = event("Recebi 100 de salário no Itaú", "income-choice", group=True)
     assert (await client.post("/webhooks/evolution", json=income, headers=headers)).status_code == 202
@@ -121,6 +126,98 @@ async def test_group_creation_routes_participant_and_ignores_chatter(client, fam
     for _ in range(16):
         await tick(family["pool"], channel=Channel())
     assert "Confirma esta receita?" in destinations[-1][1]
+
+    invoice_text = (
+        "Fatura\nValor atual\nR$ 72,31\nVence em 12/10/2026\nFecha em 01/10/2026\n"
+        "Segunda-feira, 15 de junho\nPagamento recebido R$ 10,00\nCRF 4857 BGS SAMS CLUB BA R$ 72,31"
+    )
+    monkeypatch.setattr("app.workers.runner.extract_text_from_image", lambda image, mime: invoice_text)
+    photo = event("", "image-with-pending-income", group=True)
+    photo["data"]["message"] = {"imageMessage": {"mimetype": "image/jpeg"}}
+    assert (await client.post("/webhooks/evolution", json=photo, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "outro lançamento pendente" in destinations[-1][1]
+    assert len((await client.get("/api/v1/transactions")).json()["data"]) == 1
+
+    assert (await client.post("/webhooks/evolution", json=event("cancelar", "cancel-income", group=True), headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    photo["data"]["key"]["id"] = "image-invoice"
+    photo["data"]["message"] = {"ephemeralMessage": {"message": photo["data"]["message"]}}
+    assert (await client.post("/webhooks/evolution", json=photo, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Ainda não importei nada" in destinations[-1][1]
+
+    assert (await client.post("/webhooks/evolution", json=event("cartão Sam's Club", "card-name", group=True), headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "72.31" in destinations[-1][1]
+    assert "1 pagamento(s) ou crédito(s)" in destinations[-1][1]
+    assert "soma das despesas propostas confere" in destinations[-1][1]
+    assert "Responda *sim*" in destinations[-1][1]
+
+    assert (await client.post("/webhooks/evolution", json=event("corrigir 1 73,31", "fix-amount", group=True), headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Valor corrigido" in destinations[-1][1]
+    assert "73.31" in destinations[-1][1]
+    assert (await client.post("/webhooks/evolution", json=event("categoria 1 Alimentação", "fix-category", group=True), headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Categoria corrigida" in destinations[-1][1]
+    assert "categoria sugerida: Alimentação" in destinations[-1][1]
+
+    assert (await client.post("/webhooks/evolution", json=event("sim", "confirm-invoice", group=True), headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Não importei: a soma diverge" in destinations[-1][1]
+    assert len((await client.get("/api/v1/transactions")).json()["data"]) == 1
+
+    assert (await client.post("/webhooks/evolution", json=event("confirmar mesmo assim", "confirm-exception", group=True), headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "1 lançamentos" in destinations[-1][1]
+    imported = (await client.get("/api/v1/transactions")).json()["data"]
+    assert len(imported) == 2
+    charge = next(item for item in imported if item["amount"] == "73.31")
+    assert charge["transaction_date"] == "2026-06-15"
+    invoice = (await client.get("/api/v1/invoices/" + charge["invoice_id"])).json()
+    assert invoice["closing_date"] == "2026-10-01"
+
+    monkeypatch.setattr("app.workers.runner.extract_text_from_image", lambda image, mime: "")
+    photo["data"]["key"]["id"] = "unreadable-image"
+    assert (await client.post("/webhooks/evolution", json=photo, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Não consegui identificar texto legível" in destinations[-1][1]
+    assert len((await client.get("/api/v1/transactions")).json()["data"]) == 2
+
+    from app.core.errors import DomainError
+
+    def invalid_image(image, mime):
+        raise DomainError("Formato de imagem inválido.")
+
+    monkeypatch.setattr("app.workers.runner.extract_text_from_image", invalid_image)
+    photo["data"]["key"]["id"] = "invalid-image"
+    assert (await client.post("/webhooks/evolution", json=photo, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Formato de imagem inválido" in destinations[-1][1]
+    assert "Nenhum item foi importado" in destinations[-1][1]
+
+    pdf = event("", "unsupported-pdf", group=True)
+    pdf["data"]["message"] = {"documentMessage": {"mimetype": "application/pdf"}}
+    assert (await client.post("/webhooks/evolution", json=pdf, headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "ainda não leio PDF" in destinations[-1][1]
+
+    assert (await client.post("/webhooks/evolution", json=event("sim", "nothing-to-confirm", group=True), headers=headers)).status_code == 202
+    for _ in range(16):
+        await tick(family["pool"], channel=Channel())
+    assert "Não há importação ou lançamento aguardando confirmação" in destinations[-1][1]
 
 
 @pytest.mark.asyncio

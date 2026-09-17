@@ -1,10 +1,10 @@
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from app.core.db import audit, emit, get, insert, rows, update, wire
-from app.core.errors import require
+from app.core.errors import DomainError, require
 from app.core.schemas import Transaction
 from app.modules.conversations.parser import RuleParser, amounts, evidence, intent
 from app.modules.ledger import service as ledger
@@ -156,32 +156,27 @@ async def complete(ctx, action):
 
         result = await create_budget(ctx, Budget.model_validate(candidate["budget"]))
     elif action["intent"] == "IMPORT_INVOICE":
+        summary_info = candidate.get("summary") or {}
+        require(summary_info.get("closing_date"), "Não importei: falta o fechamento da fatura.")
+        invoice_closing_date = date.fromisoformat(summary_info["closing_date"])
         card_id = candidate.get("matched_card_id")
         if card_id:
             card = await get(ctx, "credit_cards", card_id)
         else:
-            summary_info = candidate.get("summary") or {}
-            card_name = candidate.get("matched_card_name") or candidate.get("issuer") or "Cartão de Crédito"
-            due_day = 10
-            closing_day = 1
-            if summary_info.get("due_date"):
-                try:
-                    due_day = int(summary_info["due_date"].split("-")[2])
-                except Exception:
-                    pass
-            if summary_info.get("closing_date"):
-                try:
-                    closing_day = int(summary_info["closing_date"].split("-")[2])
-                except Exception:
-                    pass
-            limit_amt = summary_info.get("total_limit") or 5000.0
+            card_name = candidate.get("confirmed_card_name") or candidate.get("issuer")
+            require(
+                card_name and summary_info.get("due_date") and summary_info.get("closing_date"),
+                "Não importei: identifique o cartão e as datas de vencimento e fechamento.",
+            )
+            due_day = date.fromisoformat(summary_info["due_date"]).day
+            closing_day = date.fromisoformat(summary_info["closing_date"]).day
             card = await insert(
                 ctx,
                 "credit_cards",
                 {
                     "name": card_name,
-                    "issuer": candidate.get("issuer") or card_name,
-                    "limit_amount": limit_amt,
+                    "issuer": card_name,
+                    "limit_amount": str(summary_info["total_limit"]) if summary_info.get("total_limit") else None,
                     "closing_day": closing_day,
                     "due_day": due_day,
                 },
@@ -205,23 +200,21 @@ async def complete(ctx, action):
             return new_cat["id"]
 
         created_txs = []
-        now_date = ctx.today()
         for idx, t in enumerate(candidate.get("transactions", [])):
             if t.get("type") == "PAYMENT_OR_CREDIT":
                 continue
-
-            tx_date = now_date
-            if t.get("date"):
-                try:
-                    tx_date = datetime.strptime(t["date"], "%Y-%m-%d").date()
-                except Exception:
-                    pass
+            require(t.get("date"), "Não importei: há lançamento sem data. Confira o resumo.")
+            tx_date = date.fromisoformat(t["date"])
 
             cat_id = await get_or_create_category(t.get("category_name", "Outros"))
+            installment_label = (
+                f" (parcela {t['installment_current']}/{t['installment_total']})"
+                if t.get("installment_current") and t.get("installment_total") else ""
+            )
             tx_data = {
                 "type": "EXPENSE",
-                "amount": float(t["amount"]),
-                "description": t["description"],
+                "amount": f"{t['amount']:.2f}",
+                "description": t["description"] + installment_label,
                 "transaction_date": tx_date.isoformat(),
                 "financial_source": {
                     "kind": "CREDIT_CARD",
@@ -236,6 +229,7 @@ async def complete(ctx, action):
                 body,
                 source_type="INVOICE_OCR",
                 source_key=f"invoice:{action['id']}:{idx}",
+                invoice_closing_date=invoice_closing_date,
             )
             created_txs.append(created)
 
@@ -454,6 +448,41 @@ async def process(ctx, session, message):
             ctx, session, message, action,
             f"Ouvi: “{text}”. Está correto? Responda sim ou envie a frase correta.",
         )
+    if action and action["intent"] == "IMPORT_INVOICE":
+        card_reply = re.fullmatch(r"cart[aã]o\s+(.{2,80})", text.strip(), re.I)
+        if card_reply:
+            candidate = action["extracted_data"]
+            card_name = card_reply.group(1).strip()
+            candidate["confirmed_card_name"] = card_name
+            candidate["matched_card_id"] = None
+            existing_card = await ctx.conn.fetchrow(
+                "SELECT id,name FROM credit_cards WHERE lower(name)=lower($1) AND archived_at IS NULL ORDER BY created_at LIMIT 1",
+                card_name,
+            )
+            if existing_card:
+                candidate["matched_card_id"] = str(existing_card["id"])
+                candidate["matched_card_name"] = existing_card["name"]
+            summary = candidate.get("summary") or {}
+            from app.workers.runner import invoice_ready, mark_possible_duplicates
+
+            candidate["transactions"] = await mark_possible_duplicates(
+                ctx, candidate.get("transactions") or [], candidate.get("matched_card_id")
+            )
+
+            ready = invoice_ready(summary, candidate.get("transactions") or [], candidate.get("matched_card_id"),
+                                  candidate.get("confirmed_card_name"))
+            if ready:
+                from app.workers.runner import build_invoice_question_text
+
+                question = build_invoice_question_text(summary, candidate["transactions"], candidate["confirmed_card_name"])
+            else:
+                question = "Anotei o cartão. Ainda não importei nada: envie imagens com os lançamentos, vencimento e fechamento."
+            action = await update(ctx, "pending_financial_actions", action["id"], {
+                "extracted_data": candidate,
+                "status": "WAITING_CONFIRMATION" if ready else "WAITING_INFORMATION",
+                "question": question,
+            })
+            return await response(ctx, session, message, action, question)
     options = action["extracted_data"].get("choice_options", []) if action else []
     selected = next(
         (
@@ -467,34 +496,94 @@ async def process(ctx, session, message):
         text = selected["reply"]
     elif options and (text.strip().isdigit() or text.strip().startswith("choice:")):
         return await response(ctx, session, message, action, "Essa opção não está disponível. " + action["question"])
-    detected = intent(text)
+    exception_reply = normalize(text)
+    explicit_exception = exception_reply in ("confirmar duplicados", "confirmar parcial", "confirmar mesmo assim")
+    detected = "CONFIRM" if explicit_exception else intent(text)
     is_whatsapp = session.get("channel") == "WHATSAPP"
-    if is_whatsapp and not action and (
-        detected == "UNKNOWN"
-        or (
-            is_whatsapp
-            and detected
-            not in (
-                "CREATE_EXPENSE",
-                "CREATE_INCOME",
-                "CREATE_TRANSFER",
-                "UPDATE_TRANSACTION",
-                "DELETE_TRANSACTION",
-                "CREATE_GOAL",
-                "CREATE_BUDGET",
+    if action and action["intent"] == "IMPORT_INVOICE" and detected not in ("CONFIRM", "CANCEL"):
+        from app.modules.ingestion.invoice_parser import parse_money
+        from app.workers.runner import (
+            build_invoice_header_text,
+            build_invoice_question_text,
+            invoice_ready,
+            mark_possible_duplicates,
+        )
+
+        candidate = action["extracted_data"]
+        items = list(candidate.get("transactions") or [])
+        edit = re.fullmatch(r"corrigir\s+(\d+)\s+(?:para\s+)?(?:R\$\s*)?([\d.,]+)", text.strip(), re.I)
+        remove_item = re.fullmatch(r"remover\s+(\d+)", text.strip(), re.I)
+        category_edit = re.fullmatch(r"categoria\s+(\d+)\s+(.{2,80})", text.strip(), re.I)
+        add_item = re.fullmatch(
+            r"adicionar\s+(\d{1,2}/\d{1,2}/\d{4})\s+(.{2,160}?)\s+(?:R\$\s*)?([\d.,]+)",
+            text.strip(), re.I,
+        )
+        if edit or remove_item or category_edit or add_item:
+            visible_indexes = [i for i, item in enumerate(items) if item.get("type") != "PAYMENT_OR_CREDIT"]
+            visible_index = int((edit or remove_item or category_edit).group(1)) - 1 if not add_item else -1
+            if not add_item and not 0 <= visible_index < len(visible_indexes):
+                return await response(ctx, session, message, action, "Número de item inválido. " + action["question"])
+            index = visible_indexes[visible_index] if not add_item else -1
+            if edit:
+                amount = parse_money(edit.group(2))
+                if amount is None:
+                    return await response(ctx, session, message, action, "Valor inválido. Use, por exemplo: corrigir 2 34,17.")
+                items[index]["amount"] = amount
+            elif remove_item:
+                items.pop(index)
+            elif category_edit:
+                items[index]["category_name"] = category_edit.group(2).strip()
+                items[index]["category_source"] = "user_correction"
+            else:
+                from app.modules.categorization.merchant_classifier import classify_merchant
+
+                amount = parse_money(add_item.group(3))
+                try:
+                    item_date = datetime.strptime(add_item.group(1), "%d/%m/%Y").date()
+                except ValueError:
+                    item_date = None
+                if amount is None or item_date is None:
+                    return await response(ctx, session, message, action,
+                                          "Data ou valor inválido. Use: adicionar 01/08/2026 AMAZON BR 34,17.")
+                description = add_item.group(2).strip()
+                category = await classify_merchant(ctx, description)
+                items.append({"date": item_date.isoformat(), "description": description, "amount": amount,
+                              "type": "EXPENSE", "category_name": category["category_name"],
+                              "category_source": category["source"]})
+            candidate["transactions"] = await mark_possible_duplicates(
+                ctx, items, candidate.get("matched_card_id")
             )
-            and not detected.startswith("QUERY_")
-        )
-    ):
-        await update(
-            ctx,
-            "conversation_messages",
-            message["id"],
-            {
-                "processing_status": "PROCESSED",
-                "processed_at": now,
-            },
-        )
+            summary = candidate.get("summary") or {}
+            card_name = candidate.get("confirmed_card_name") or candidate.get("matched_card_name") or "Cartão de Crédito"
+            ready = invoice_ready(summary, items, candidate.get("matched_card_id"),
+                                  candidate.get("confirmed_card_name") or candidate.get("issuer"))
+            question = (build_invoice_question_text(summary, items, card_name) if ready
+                        else build_invoice_header_text(summary, card_name, bool(candidate.get("matched_card_id"))))
+            action = await update(ctx, "pending_financial_actions", action["id"], {
+                "extracted_data": candidate,
+                "status": "WAITING_CONFIRMATION" if ready else "WAITING_INFORMATION",
+                "question": question,
+            })
+            change = ("Valor corrigido. " if edit else "Item removido. " if remove_item
+                      else "Categoria corrigida. " if category_edit else "Item adicionado. ")
+            return await response(ctx, session, message, action, change + question)
+        if detected == "UNKNOWN":
+            return await response(
+                ctx, session, message, action,
+                "Não entendi a resposta e não importei nada. "
+                "Envie mais imagens, informe ‘cartão Nome’, use ‘corrigir 2 34,17’, "
+                "‘categoria 2 Supermercado’, ‘adicionar 01/08/2026 AMAZON BR 34,17’, "
+                "‘remover 2’, ‘sim’ ou ‘cancelar’.\n"
+                + (action.get("question") or ""),
+            )
+    if is_whatsapp and not action and detected == "UNKNOWN":
+        if session.get("whatsapp_group_id"):
+            return await response(
+                ctx, session, message, None,
+                "Não entendi o pedido e não importei nada. Envie uma foto nítida da fatura, "
+                "ou escreva, por exemplo, ‘Gastei 35 no mercado no cartão X’ ou ‘quanto gastei este mês?’."
+            )
+        await update(ctx, "conversation_messages", message["id"], {"processing_status": "PROCESSED", "processed_at": now})
         return None
     if detected == "CANCEL":
         if action:
@@ -504,9 +593,12 @@ async def process(ctx, session, message):
                 session,
                 message,
                 action,
-                "Lançamento pendente cancelado.",
+                "Importação cancelada. Nenhum item foi registrado."
+                if action["intent"] == "IMPORT_INVOICE" else "Lançamento pendente cancelado.",
             )
         if is_whatsapp:
+            if session.get("whatsapp_group_id"):
+                return await response(ctx, session, message, None, "Não há importação ou lançamento pendente para cancelar.")
             await update(
                 ctx,
                 "conversation_messages",
@@ -525,6 +617,11 @@ async def process(ctx, session, message):
             "Não há lançamento pendente.",
         )
     if detected == "CONFIRM":
+        if action and action["intent"] == "IMPORT_INVOICE" and action["status"] == "WAITING_INFORMATION":
+            return await response(
+                ctx, session, message, action,
+                "Ainda não importei a fatura: faltam informações. " + (action.get("question") or "Envie outra imagem legível."),
+            )
         if (
             action
             and action["status"] == "WAITING_INFORMATION"
@@ -536,6 +633,22 @@ async def process(ctx, session, message):
             )
             action["extracted_data"] = candidate
         elif action and action["status"] == "WAITING_CONFIRMATION":
+            if action["intent"] == "IMPORT_INVOICE":
+                from app.workers.runner import invoice_difference
+
+                items = action["extracted_data"].get("transactions", [])
+                has_duplicate = any(item.get("possible_duplicate") for item in items)
+                difference = invoice_difference(action["extracted_data"].get("summary") or {}, items)
+                if (has_duplicate or difference not in (None, 0)) and (
+                    not explicit_exception or
+                    (difference not in (None, 0) and exception_reply == "confirmar duplicados")
+                ):
+                    return await response(
+                        ctx, session, message, action,
+                        "Não importei: a soma diverge da fatura ou há possíveis duplicatas. "
+                        "Corrija, envie mais imagens ou responda *confirmar mesmo assim* após conferir.\n"
+                        + (action.get("question") or ""),
+                    )
             if action["target_transaction_id"]:
                 target = await get(ctx, "transactions", action["target_transaction_id"])
                 if target["version"] != action["target_version"]:
@@ -549,7 +662,18 @@ async def process(ctx, session, message):
                         action,
                         "O lançamento mudou desde a proposta. Solicite a correção novamente.",
                     )
-            action, result = await complete(ctx, action)
+            if action["intent"] == "IMPORT_INVOICE":
+                try:
+                    async with ctx.conn.transaction():
+                        action, result = await complete(ctx, action)
+                except (DomainError, ValueError) as exc:
+                    detail = exc.message if isinstance(exc, DomainError) else "data ou valor inválido"
+                    return await response(
+                        ctx, session, message, action,
+                        f"Não importei a fatura: {detail}. Confira a proposta ou envie *cancelar*.",
+                    )
+            else:
+                action, result = await complete(ctx, action)
             if action["intent"] == "IMPORT_INVOICE":
                 msg = f"✅ *{result['imported_count']} lançamentos* da fatura importados com sucesso no cartão *{result['card_name']}*!"
                 return await response(ctx, session, message, action, msg, result)
@@ -557,16 +681,10 @@ async def process(ctx, session, message):
                 ctx, session, message, action, "✅ Operação confirmada e registrada.", result
             )
         else:
+            if is_whatsapp and session.get("whatsapp_group_id"):
+                return await response(ctx, session, message, None, "Não há importação ou lançamento aguardando confirmação.")
             if is_whatsapp:
-                await update(
-                    ctx,
-                    "conversation_messages",
-                    message["id"],
-                    {
-                        "processing_status": "PROCESSED",
-                        "processed_at": now,
-                    },
-                )
+                await update(ctx, "conversation_messages", message["id"], {"processing_status": "PROCESSED", "processed_at": now})
                 return None
             return await response(
                 ctx,

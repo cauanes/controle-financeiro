@@ -143,10 +143,17 @@ async def create(
     metadata=None,
     recurring_id=None,
     occurrence_date=None,
+    invoice_closing_date=None,
 ):
     ctx.write()
     await ctx.lock()
     values = await validate(ctx, body)
+    if invoice_closing_date is not None:
+        require(
+            source_type == "INVOICE_OCR" and body.financial_source.kind == "CREDIT_CARD"
+            and body.installment_count == 1,
+            "Ciclo de fatura explícito só é permitido na importação de uma parcela de cartão.",
+        )
     chunks = installments(body.amount, body.installment_count)
     group = uuid4() if len(chunks) > 1 else None
     source_key = source_key or str(uuid4())
@@ -154,8 +161,13 @@ async def create(
     for i, amount in enumerate(chunks):
         item = {**values, "amount": amount, "actor_user_id": ctx.user_id}
         if item["credit_card_id"]:
-            invoice = await ensure_invoice(ctx, item["credit_card_id"], body.transaction_date, i)
+            invoice = await ensure_invoice(
+                ctx, item["credit_card_id"], invoice_closing_date or body.transaction_date, i
+            )
             item.update(invoice_id=invoice["id"], due_date=invoice["due_date"])
+            if invoice_closing_date is not None:
+                require(invoice["closing_date"] == invoice_closing_date, "Fechamento não corresponde ao cartão.")
+                item["competence_date"] = invoice["closing_date"]
             if group:
                 item.update(
                     installment_group_id=group,
