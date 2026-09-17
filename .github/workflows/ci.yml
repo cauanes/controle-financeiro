@@ -27,6 +27,10 @@ jobs:
       TEST_ADMIN_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v7
+      - name: Install system dependencies for OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-por tesseract-ocr-eng libgl1 libglib2.0-0
       - uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: '3.12'

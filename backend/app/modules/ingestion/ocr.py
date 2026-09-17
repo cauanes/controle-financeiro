@@ -4,6 +4,7 @@ import os
 os.environ["OMP_THREAD_LIMIT"] = "1"
 
 from pathlib import Path
+
 import cv2
 import numpy as np
 import pytesseract
