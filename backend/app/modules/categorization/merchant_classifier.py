@@ -51,46 +51,131 @@ KNOWN_MERCHANT_PATTERNS: dict[str, list[str]] = {
 
 # Snippet scoring for SearXNG fallback
 SEARXNG_KEYWORD_MAP = {
-    "Alimentação": ["restaurante", "salgados", "lanchonete", "comida", "padaria", "confeitaria", "lanches", "delivery", "buffet", "gastronomia"],
-    "Supermercado": ["supermercado", "hipermercado", "mercearia", "atacadista", "clube de compras", "alimentos", "varejo de alimentos"],
-    "Combustível": ["posto de combustiveis", "gasolina", "etanol", "diesel", "abastecimento", "combustivel", "postos"],
-    "Transporte": ["transporte", "mobilidade", "passageiros", "estacionamento", "pedagio", "locadora de veiculos"],
-    "Compras": ["loja", "e-commerce", "roupas", "calcados", "artigos", "varejo", "eletronicos", "comercio varejista"],
-    "Assinaturas": ["assinatura", "software", "saas", "streaming", "mensalidade", "plataforma online", "servicos digitais"],
-    "Saúde": ["farmacia", "drogaria", "medicamentos", "medico", "clinica", "hospital", "saude", "odontologia"],
+    "Supermercado": [
+        "supermercado", "hipermercado", "mercearia", "atacadista", "clube de compras",
+        "mercadorias em geral", "varejo de alimentos", "assai", "atacadao", "hortifruti",
+        "varejista de mercadorias", "distribuidora de alimentos", "alimentos e bebidas"
+    ],
+    "Alimentação": [
+        "restaurante", "salgados", "lanchonete", "comida", "padaria", "confeitaria",
+        "lanches", "delivery", "buffet", "gastronomia", "refeicoes", "mcdonald", "fast food",
+        "bar", "cafe", "cafeteria", "hamburguer", "churrascaria", "pizzaria", "alimenticios", "alimentos"
+    ],
+    "Combustível": [
+        "posto de combustiveis", "gasolina", "etanol", "diesel", "abastecimento", "combustivel",
+        "combustíveis", "postos", "carburante", "lubrificantes", "petroleo", "raizen", "ipiranga", "vibra"
+    ],
+    "Transporte": [
+        "transporte", "mobilidade", "passageiros", "estacionamento", "pedagio", "locadora de veiculos",
+        "locacao de automoveis", "uber", "taxi", "táxi", "99", "concessionaria de rodovias", "rodovias",
+        "linha aerea", "passagens", "logistica"
+    ],
+    "Compras": [
+        "loja", "e-commerce", "roupas", "calcados", "artigos", "varejo", "eletronicos",
+        "comercio varejista", "departamento", "magazine", "vestuario", "utilidades", "papelaria", "livraria"
+    ],
+    "Assinaturas": [
+        "assinatura", "software", "saas", "streaming", "mensalidade", "plataforma online",
+        "servicos digitais", "processamento de dados", "tecnologia da informacao", "hospedagem"
+    ],
+    "Saúde": [
+        "farmacia", "drogaria", "medicamentos", "medico", "clinica", "hospital", "saude",
+        "odontologia", "consultorio", "laboratorio", "exames", "plano de saude", "medicamento", "terapia"
+    ],
+    "Educação": [
+        "escola", "colegio", "universidade", "faculdade", "curso", "educacao", "ensino",
+        "treinamento", "idiomas", "educacional"
+    ],
+    "Moradia": [
+        "energia eletrica", "saneamento", "agua e esgoto", "gas encanado", "condominio",
+        "imobiliaria", "aluguel", "eletricidade"
+    ],
+    "Lazer": [
+        "cinema", "teatro", "show", "eventos", "ingressos", "parque", "viagem", "hotel",
+        "pousada", "turismo"
+    ],
 }
+
+CORPORATE_ENTITY_MARKERS = (
+    "LTDA", "S.A.", "S/A", "EIRELI", "ME", "EPP", "DISTRIBUIDORA", "COMERCIO",
+    "PARTICIPACOES", "PAGAMENTOS", "SERVICOS", "EMPREENDIMENTOS", "INDUSTRIA",
+    "ALIMENTOS", "LOGISTICA", "TRANSPORTES", "AUTO POSTO", "DROGARIA", "FARMACIA"
+)
+
+
+async def query_searxng(query_str: str, count: int = 5) -> list[dict]:
+    """Helper to query local SearXNG with fallback host resolution."""
+    if not settings.searxng_url:
+        return []
+    urls = [settings.searxng_url]
+    if "host.docker.internal" in settings.searxng_url:
+        urls.append(settings.searxng_url.replace("host.docker.internal", "localhost"))
+        urls.append(settings.searxng_url.replace("host.docker.internal", "127.0.0.1"))
+    elif "localhost" in settings.searxng_url:
+        urls.append(settings.searxng_url.replace("localhost", "host.docker.internal"))
+
+    for base_url in urls:
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                res = await client.get(
+                    f"{base_url.rstrip('/')}/search",
+                    params={"q": query_str, "format": "json", "language": "pt-BR"},
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    return data.get("results", [])[:count]
+        except Exception:
+            continue
+    return []
 
 
 async def search_searxng(query: str) -> tuple[str | None, float]:
-    """Fallback classifier querying local SearXNG instance."""
+    """Fallback classifier querying local SearXNG instance with corporate entity and CNPJ enrichment."""
     if not settings.searxng_url:
         return None, 0.0
     clean_q = re.sub(r"[\*#\-_/]", " ", query)
     clean_q = re.sub(r"\s+", " ", clean_q).strip()
-    clean_q = f'"{clean_q}" brasil'
-    
+    if not clean_q:
+        return None, 0.0
+
+    cnpj_match = re.search(r"(?<!\d)\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}(?!\d)|\b\d{14}\b", query)
+    upper_query = query.upper()
+    is_corporate = bool(cnpj_match) or any(marker in upper_query for marker in CORPORATE_ENTITY_MARKERS)
+
+    if cnpj_match:
+        cnpj_digits = re.sub(r"\D", "", cnpj_match.group(0))
+        search_query = f'"{cnpj_digits}" razao social nome fantasia brasil'
+    elif is_corporate:
+        search_query = f'"{clean_q}" razao social nome fantasia atividade brasil'
+    else:
+        search_query = f'"{clean_q}" atividade comercio servico brasil'
+
     try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            res = await client.get(
-                f"{settings.searxng_url.rstrip('/')}/search",
-                params={"q": clean_q, "format": "json", "language": "pt-BR"}
-            )
-            if res.status_code == 200:
-                data = res.json()
-                results = data.get("results", [])
-                snippets = [r.get("title", "") + " " + r.get("content", "") for r in results[:5]]
-                full_text = normalize(" ".join(snippets))
-                
-                category_scores: dict[str, int] = {}
-                for cat, keywords in SEARXNG_KEYWORD_MAP.items():
-                    score = sum(1 for kw in keywords if normalize(kw) in full_text)
-                    if score > 0:
-                        category_scores[cat] = score
-                
-                if category_scores:
-                    best_cat = max(category_scores, key=category_scores.get)
-                    confidence = min(0.85, 0.5 + 0.1 * category_scores[best_cat])
-                    return best_cat, confidence
+        results = await query_searxng(search_query, count=5)
+        if not results:
+            return None, 0.0
+
+        snippets = [r.get("title", "") + " " + r.get("content", "") for r in results]
+        full_text = normalize(" ".join(snippets))
+
+        # Check if any known brand pattern appears in the search snippet results
+        for category_name, patterns in KNOWN_MERCHANT_PATTERNS.items():
+            for pat in patterns:
+                pat_norm = normalize(pat)
+                if re.search(r"(?<!\w)" + re.escape(pat_norm) + r"(?!\w)", full_text):
+                    return category_name, 0.85
+
+        # Score categories based on domain keywords in search snippets
+        category_scores: dict[str, int] = {}
+        for cat, keywords in SEARXNG_KEYWORD_MAP.items():
+            score = sum(1 for kw in keywords if normalize(kw) in full_text)
+            if score > 0:
+                category_scores[cat] = score
+
+        if category_scores:
+            best_cat = max(category_scores, key=category_scores.get)
+            confidence = min(0.85, 0.5 + 0.1 * category_scores[best_cat])
+            return best_cat, confidence
     except Exception:
         pass
     return None, 0.0
