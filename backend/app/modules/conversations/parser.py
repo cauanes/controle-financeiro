@@ -53,6 +53,50 @@ NUMBERS = {
 }
 
 
+WORD_TO_NUMBER = {
+    "um": 1, "uma": 1, "dois": 2, "duas": 2, "tres": 3, "três": 3, "quatro": 4,
+    "cinco": 5, "seis": 6, "sete": 7, "oito": 8, "nove": 9, "dez": 10,
+    "onze": 11, "doze": 12, "treze": 13, "quatorze": 14, "catorze": 14,
+    "quinze": 15, "dezesseis": 16, "dezessete": 17, "dezoito": 18, "dezenove": 19,
+    "vinte": 20, "vinte e quatro": 24, "trinta e seis": 36, "quarenta e oito": 48
+}
+
+
+def extract_installment_multiplier(text: str) -> tuple[int, str, str] | None:
+    norm = normalize(text)
+    words_pat = "|".join(sorted(WORD_TO_NUMBER.keys(), key=len, reverse=True))
+    pat = rf"\b(\d+|{words_pat})\s*(?:x|vezes|parcelas?)\s+de\s+(?:r\$|rs)?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[,.]\d{1,2})?)\b"
+    m = re.search(pat, norm, re.I)
+    if m:
+        count_raw = m.group(1).lower()
+        count = int(count_raw) if count_raw.isdigit() else WORD_TO_NUMBER.get(count_raw)
+        val_str = m.group(2)
+        val_clean = val_str.replace(".", "").replace(",", ".") if "," in val_str or re.fullmatch(r"\d{1,3}(?:\.\d{3})+", val_str) else val_str
+        try:
+            val_dec = money(val_clean, positive=True)
+            if count and 1 <= count <= 120 and val_dec > 0:
+                total_dec = val_dec * count
+                return count, format(total_dec, ".2f"), format(val_dec, ".2f")
+        except Exception:
+            pass
+    return None
+
+
+def extract_installment_count(text: str) -> int | None:
+    norm = normalize(text)
+    words_pat = "|".join(sorted(WORD_TO_NUMBER.keys(), key=len, reverse=True))
+    if re.search(r"\b(?:a vista|a\s+vista|em 1x|1x)\b", norm):
+        return 1
+    pat = rf"\b(?:em|parcelado em|dividido em|em ate|em até)?\s*(\d+|{words_pat})\s*(?:x|vezes|parcelas?)\b"
+    m = re.search(pat, norm, re.I)
+    if m:
+        count_raw = m.group(1).lower()
+        count = int(count_raw) if count_raw.isdigit() else WORD_TO_NUMBER.get(count_raw)
+        if count and 1 <= count <= 120:
+            return count
+    return None
+
+
 class FinancialParser(Protocol):
     async def parse(self, ctx, text, today, existing=None, answer_field=None): ...
 
@@ -97,6 +141,8 @@ def intent(text):
         return "CREATE_EXPENSE"
     if contains(value, "paciente") and amounts(text):
         return "CREATE_INCOME"
+    if re.search(r"\b\d+\s*(?:x|parcelas?|vezes)\b", value) and (amounts(text) or extract_installment_multiplier(text)):
+        return "CREATE_EXPENSE"
     if re.search(r"\d.*\b(mercado|gasolina|amazon|reais|credito|debito|pix)\b", value) or re.search(
         r"\bcompra\s+de\b", value
     ):
@@ -108,7 +154,9 @@ def amounts(text):
     value = normalize(text)
     # Dates and installment counts must not become amounts.
     value = re.sub(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", " ", value)
-    value = re.sub(r"\b\d+\s*(?:x|parcelas?)\b", " ", value)
+    value = re.sub(r"\b\d+\s*(?:x|parcelas?|vezes)\b", " ", value)
+    words_pat = "|".join(sorted(WORD_TO_NUMBER.keys(), key=len, reverse=True))
+    value = re.sub(rf"\b(?:{words_pat})\s*(?:x|parcelas?|vezes)\b", " ", value)
     numeric = re.findall(
         r"(?<![\w/])\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|(?<![\w/])\d+(?:[,.]\d{1,2})?(?![\d/])", value
     )
@@ -177,13 +225,27 @@ class RuleParser:
         income_profiles = await rows(ctx, "income_activity_profiles") if kind == "INCOME" else []
         if kind:
             fields["type"] = evidence(kind)
-        if "amount" not in fields or answer_field == "amount":
-            values = amounts(text)
-            if len(set(values)) == 1:
-                fields["amount"] = evidence(values[0])
-            elif len(values) > 1:
-                candidate["ambiguous_fields"].append("amount")
-                fields.pop("amount", None)
+        multiplier = extract_installment_multiplier(text)
+        if multiplier:
+            count, total_str, unit_str = multiplier
+            fields["amount"] = evidence(total_str)
+            fields["installment_count"] = evidence(count)
+            candidate["unit_installment_amount"] = unit_str
+        else:
+            if "amount" not in fields or answer_field == "amount":
+                values = amounts(text)
+                if len(set(values)) == 1:
+                    fields["amount"] = evidence(values[0])
+                elif len(values) > 1:
+                    candidate["ambiguous_fields"].append("amount")
+                    fields.pop("amount", None)
+            count = extract_installment_count(text)
+            if count is not None:
+                fields["installment_count"] = evidence(count)
+            elif answer_field == "installment_count" and text.strip().isdigit():
+                val = int(text.strip())
+                if 1 <= val <= 120:
+                    fields["installment_count"] = evidence(val)
         d, uncertain = parse_date(text, today)
         if d:
             fields["transaction_date"] = evidence(d)
@@ -199,9 +261,13 @@ class RuleParser:
         cards = [c for c in await rows(ctx, "credit_cards") if not c["archived_at"]]
         source_matches = []
         payment = None
-        if contains(norm, "credito"):
+        inst_val = fields.get("installment_count", {}).get("value", 1)
+        if contains(norm, "credito") or (
+            inst_val and inst_val > 1
+            and not (contains(norm, "debito") or contains(norm, "pix") or contains(norm, "dinheiro") or contains(norm, "conta"))
+        ):
             payment = "CREDIT_CARD"
-        if (
+        elif (
             contains(norm, "debito")
             or contains(norm, "pix")
             or contains(norm, "dinheiro")

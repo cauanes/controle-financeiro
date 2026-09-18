@@ -1,5 +1,6 @@
 import re
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -872,5 +873,21 @@ async def process(ctx, session, message):
         if fields.get("category_id", {}).get("value")
         else None
     )
-    question = f"✅ R$ {value} registrado em {category['name'] if category else 'Sem categoria'} — {label}, {fields['transaction_date']['value']}."
+    inst_count = fields.get("installment_count", {}).get("value", 1)
+    if inst_count and inst_count > 1 and source["kind"] == "CREDIT_CARD":
+        per_installment = Decimal(value) / inst_count
+        first_invoice = ""
+        if isinstance(result, dict) and "transactions" in result and result["transactions"]:
+            first_tx = result["transactions"][0]
+            if isinstance(first_tx, dict) and first_tx.get("due_date"):
+                due_val = first_tx["due_date"]
+                due_str = due_val.strftime("%d/%m/%Y") if hasattr(due_val, "strftime") else str(due_val)
+                first_invoice = f" (1ª parcela na fatura com vencimento em {due_str})"
+        question = (
+            f"✅ Compra de R$ {value} parcelada em {inst_count}x de R$ {per_installment:.2f} "
+            f"registrada em {category['name'] if category else 'Sem categoria'} — {label}, {fields['transaction_date']['value']}."
+            f"\n📅 Lançamentos distribuídos para os próximos {inst_count} meses{first_invoice}."
+        )
+    else:
+        question = f"✅ R$ {value} registrado em {category['name'] if category else 'Sem categoria'} — {label}, {fields['transaction_date']['value']}."
     return await response(ctx, session, message, action, question, result)

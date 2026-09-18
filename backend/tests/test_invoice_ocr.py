@@ -267,3 +267,17 @@ def test_parse_caixa_invoice():
     assert res.transactions[0].card.last4 == "4804"
     assert res.transactions[0].card.holder == "CAUAN ESPLUGUES SILVA"
 
+
+def test_extract_invoice_installments_various_formats():
+    from app.modules.ingestion.invoice_parser import extract_invoice_installment
+
+    assert extract_invoice_installment("LOJA XYZ (02/10)") == (2, 10)
+    assert extract_invoice_installment("MERCADO LIVRE (2/10)") == (2, 10)
+    assert extract_invoice_installment("MAGAZINELUIZA PARC 03/12") == (3, 12)
+    assert extract_invoice_installment("AMAZON BR PARC. 01/05") == (1, 5)
+    assert extract_invoice_installment("CASAS BAHIA parcela 4 de 10") == (4, 10)
+    assert extract_invoice_installment("FAST SHOP 05/10") == (5, 10)
+    assert extract_invoice_installment("UBER TRIP") is None
+    assert extract_invoice_installment("PG PL RECANTO SALTO") is None
+
+
