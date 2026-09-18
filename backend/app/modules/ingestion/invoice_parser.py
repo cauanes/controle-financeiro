@@ -105,6 +105,28 @@ def detect_issuer(text: str) -> str | None:
     return None
 
 
+def extract_invoice_installment(text: str) -> tuple[int, int] | None:
+    # 1. "parcela 02/10", "parcela 2 de 10", "parc 2/10", "parc. 02/10", "parc 02 de 10"
+    m = re.search(r"\b(?:parcelas?|parc\.?)\s*(\d{1,2})\s*(?:[/]|de|\s+de\s+)\s*(\d{1,2})\b", text, re.I)
+    if m:
+        c, t = int(m.group(1)), int(m.group(2))
+        if 1 <= c <= t <= 120:
+            return c, t
+    # 2. "(02/10)", "(2/10)", "(02 de 10)"
+    m = re.search(r"\(\s*(\d{1,2})\s*(?:[/]|de|\s+de\s+)\s*(\d{1,2})\s*\)", text, re.I)
+    if m:
+        c, t = int(m.group(1)), int(m.group(2))
+        if 1 <= c <= t <= 120:
+            return c, t
+    # 3. Trailing " 02/10" or " 2/10"
+    m = re.search(r"\s+(\d{1,2})/(\d{1,2})\s*$", text)
+    if m:
+        c, t = int(m.group(1)), int(m.group(2))
+        if 1 <= c <= t <= 120:
+            return c, t
+    return None
+
+
 def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
     if default_year is None:
         default_year = datetime.now().year
@@ -218,8 +240,6 @@ def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
         r"^([\w\*\.,\s_/&@#'’\-]{2,80}?)\s+(?:(?:-|—|\+)\s*)?(?:R\$|RS|R\s*\$|\$)\s*([\d\.,]+)$",
         re.I,
     )
-
-    installment_regex = re.compile(r"parcela\s*(\d+)\s*[/de\s]+\s*(\d+)", re.I)
 
     for idx, line in enumerate(lines):
         # Check Date Header
@@ -341,10 +361,9 @@ def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
             item_card = current_card
 
             # Check installment directly in line
-            m_self_inst = installment_regex.search(desc_clean)
-            if m_self_inst:
-                inst_curr = int(m_self_inst.group(1))
-                inst_total = int(m_self_inst.group(2))
+            inst_match = extract_invoice_installment(desc_clean)
+            if inst_match:
+                inst_curr, inst_total = inst_match
 
             # Look ahead next 2 lines for installment details only (stop if next line is another item/header)
             for next_line in lines[idx + 1 : min(len(lines), idx + 3)]:
@@ -354,10 +373,9 @@ def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
                     or card_regex.search(next_line)
                 ):
                     break
-                m_inst = installment_regex.search(next_line)
-                if m_inst and not inst_curr:
-                    inst_curr = int(m_inst.group(1))
-                    inst_total = int(m_inst.group(2))
+                next_inst = extract_invoice_installment(next_line)
+                if next_inst and not inst_curr:
+                    inst_curr, inst_total = next_inst
 
             # Determine transaction category/type
             tx_type = "EXPENSE"
