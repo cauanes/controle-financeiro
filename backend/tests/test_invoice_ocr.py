@@ -281,3 +281,48 @@ def test_extract_invoice_installments_various_formats():
     assert extract_invoice_installment("PG PL RECANTO SALTO") is None
 
 
+def test_parse_mobile_app_screenshot_with_trailing_arrows_and_end_dates():
+    sample_text = """
+    am ah [AGO] (SET)
+    AMAZON BR 13/09/2026
+    RS 32,43 >
+    Megoda
+    DL*GOOGLE Micros 07/09/2026
+    R$ 11,90 >
+    Aprovado
+    BURGER KING 07/09/2026
+    R$ 57,70 >
+    Aprovada
+    AMAZON BR 06/09/2026
+    R$67,85 >
+    Aprovada
+    KALUNGA.COM 06/09/2026
+    R$ 60,74 >
+    Aprovada
+    Zet 05/09/2026
+    R$ 12,50 >
+    Aprovada
+    """
+    res = parse_invoice(sample_text, default_year=2026)
+    assert len(res.transactions) == 6
+    assert res.transactions[0].description == "AMAZON BR"
+    assert res.transactions[0].amount == 32.43
+    assert res.transactions[0].date == "2026-09-13"
+    assert res.transactions[1].description == "DL*GOOGLE Micros"
+    assert res.transactions[1].amount == 11.90
+    assert res.transactions[1].date == "2026-09-07"
+    assert res.transactions[2].description == "BURGER KING"
+    assert res.transactions[2].amount == 57.70
+    assert res.transactions[2].date == "2026-09-07"
+    assert res.transactions[3].description == "AMAZON BR"
+    assert res.transactions[3].amount == 67.85
+    assert res.transactions[3].date == "2026-09-06"
+    assert res.transactions[4].description == "KALUNGA.COM"
+    assert res.transactions[4].amount == 60.74
+    assert res.transactions[4].date == "2026-09-06"
+    assert res.transactions[5].description == "Zet"
+    assert res.transactions[5].amount == 12.50
+    assert res.transactions[5].date == "2026-09-05"
+
+
+
