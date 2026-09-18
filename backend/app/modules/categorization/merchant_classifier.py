@@ -131,8 +131,6 @@ async def query_searxng(query_str: str, count: int = 5) -> list[dict]:
 
 async def search_searxng(query: str) -> tuple[str | None, float]:
     """Fallback classifier querying local SearXNG instance with corporate entity and CNPJ enrichment."""
-    if not settings.searxng_url:
-        return None, 0.0
     clean_q = re.sub(r"[\*#\-_/]", " ", query)
     clean_q = re.sub(r"\s+", " ", clean_q).strip()
     if not clean_q:
