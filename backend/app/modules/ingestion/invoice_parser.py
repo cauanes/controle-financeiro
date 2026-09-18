@@ -131,7 +131,7 @@ def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
     if default_year is None:
         default_year = datetime.now().year
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [re.sub(r"[\s>»—]+$", "", line).strip() for line in text.splitlines() if line.strip()]
     summary = InvoiceSummary(issuer=detect_issuer(text))
     
     # 1. Parse Summary & Header Fields
@@ -167,9 +167,9 @@ def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
             yr = int(m_venc.group(3)) if m_venc.group(3) else default_year
             summary.due_date = f"{yr:04d}-{m_num:02d}-{d:02d}"
 
-        # Fechamento / Melhor dia
+        # Fechamento / Melhor dia / Melhor data de compra
         m_fech = re.search(
-            r"\b(?:fecha\s+em|fechamento|melhor dia)\s*[:\s]*(\d{1,2})[/\.](\d{1,2})(?:[/\.](\d{2,4}))?",
+            r"\b(?:fecha\s+em|fechamento|melhor dia|melhor data(?:\s+de\s+compra)?)\s*[:\.\s]*(\d{1,2})[/\.](\d{1,2})(?:[/\.](\d{2,4}))?",
             line,
             re.I,
         )
@@ -278,18 +278,22 @@ def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
         # separate lines. Only pair them when the previous line looks like a
         # merchant, never with a date, card label or invoice summary.
         m_item = item_regex.match(line)
-        amount_only = re.fullmatch(r"(?:R\$|RS|R\s*\$|\$)\s*([\d\.,]+)", line, re.I)
+        amount_only = re.search(r"^(?:R\$|RS|R\s*\$|\$)\s*([\d\.,]+)$", line, re.I)
         previous = lines[idx - 1] if idx else ""
-        separate_item = (
-            amount_only
-            and previous
-            and not re.search(
-                r"\b(fatura|valor|total|limite|dispon[ií]vel|cart[aã]o|parcela|vence|fecha|lan[çc]amentos)\b",
+        is_pure_date = bool(date_regex.fullmatch(previous) or short_date_regex.fullmatch(previous))
+        is_summary_word = bool(
+            re.search(
+                r"\b(valor total|valor atual|total da fatura|total atual|fatura|limite|dispon[ií]vel|umite|vencimento|melhor dia|dolar do dia|historico de compras)\b",
                 previous,
                 re.I,
             )
-            and not date_regex.search(previous)
-            and len(previous) >= 4
+        )
+        separate_item = (
+            bool(amount_only)
+            and bool(previous)
+            and not is_summary_word
+            and not is_pure_date
+            and len(previous) >= 3
         )
         if m_item or separate_item:
             desc = (m_item.group(1) if m_item else previous).strip()
@@ -349,13 +353,21 @@ def parse_invoice(text: str, default_year: int | None = None) -> InvoiceResult:
                 continue
 
             item_date = current_date
-            m_inline_date = re.match(r"^(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?\s+(.*)$", desc_clean)
-            if m_inline_date:
-                d_val, m_val = int(m_inline_date.group(1)), int(m_inline_date.group(2))
-                y_val = int(m_inline_date.group(3)) if m_inline_date.group(3) else default_year
+            m_start_date = re.match(r"^(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?\s+(.*)$", desc_clean)
+            if m_start_date:
+                d_val, m_val = int(m_start_date.group(1)), int(m_start_date.group(2))
+                y_val = int(m_start_date.group(3)) if m_start_date.group(3) else default_year
                 item_date = f"{y_val:04d}-{m_val:02d}-{d_val:02d}"
-                desc_clean = m_inline_date.group(4).strip(" -—.,")
+                desc_clean = m_start_date.group(4).strip(" -—.,")
                 desc_l = desc_clean.lower()
+            else:
+                m_end_date = re.match(r"^(.*?)\s+(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?$", desc_clean)
+                if m_end_date:
+                    d_val, m_val = int(m_end_date.group(2)), int(m_end_date.group(3))
+                    y_val = int(m_end_date.group(4)) if m_end_date.group(4) else default_year
+                    item_date = f"{y_val:04d}-{m_val:02d}-{d_val:02d}"
+                    desc_clean = m_end_date.group(1).strip(" -—.,")
+                    desc_l = desc_clean.lower()
 
             inst_curr, inst_total = None, None
             item_card = current_card
