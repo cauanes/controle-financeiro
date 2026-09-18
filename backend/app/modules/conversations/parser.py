@@ -121,6 +121,10 @@ def intent(text):
         return "QUERY_NET_WORTH"
     if re.search(r"\b(fluxo de caixa)\b", value):
         return "QUERY_CASHFLOW"
+    if re.search(r"\b(dolar|euro|cambio|cotacao|moedas?)\b", value) and not re.search(r"\b(gastei|paguei|comprei|recebi|transferi)\b", value):
+        return "QUERY_CURRENCY"
+    if re.search(r"\b(selic|cdi|ipca|inflacao|indicadores)\b", value) and not re.search(r"\b(gastei|paguei|comprei|recebi|transferi)\b", value):
+        return "QUERY_ECONOMIC_INDICATORS"
     if re.search(r"\b(quanto|quais|mostr[ae]|consult[ae]|listar)\b", value):
         if "orcamento" in value:
             return "QUERY_BUDGET"

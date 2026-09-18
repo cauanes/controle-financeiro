@@ -96,3 +96,36 @@ async def test_installment_expenses(client):
     assert r3["status"] == "CONFIRMED", r3
     assert "parcelada em 2x de R$ 100.00" in r3["question"]
 
+
+async def test_financial_indicators_and_currency_queries(client):
+    r_currency = await say(client, "qual a cotação do dólar hoje?")
+    assert r_currency["status"] == "ANSWERED"
+    assert "Dólar" in r_currency["question"] or "Cotaç" in r_currency["question"] or "R$" in r_currency["question"]
+
+    r_euro = await say(client, "câmbio do euro hoje")
+    assert r_euro["status"] == "ANSWERED"
+    assert "Euro" in r_euro["question"] or "Cotaç" in r_euro["question"] or "R$" in r_euro["question"]
+
+    r_selic = await say(client, "qual a taxa selic e cdi hoje?")
+    assert r_selic["status"] == "ANSWERED"
+    assert "Selic" in r_selic["question"] or "CDI" in r_selic["question"] or "Indicadores" in r_selic["question"]
+
+
+async def test_searxng_corporate_merchant_classification():
+    from app.modules.categorization.merchant_classifier import classify_merchant
+
+    class DummyCtx:
+        conn = None
+
+    ctx = DummyCtx()
+    sendas = await classify_merchant(ctx, "SENDAS DISTRIBUIDORA S.A.")
+    assert sendas["category_name"] == "Supermercado"
+    assert sendas["source"] in ("local_searxng", "known_brand_rule")
+
+    raizen = await classify_merchant(ctx, "RAIZEN COMBUSTIVEIS S.A.")
+    assert raizen["category_name"] == "Combustível"
+
+    cnpj_sendas = await classify_merchant(ctx, "06.057.223/0001-71")
+    assert cnpj_sendas["category_name"] == "Supermercado"
+
+
